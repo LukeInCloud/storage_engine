@@ -71,7 +71,8 @@ type DB struct {
 type writeReq struct {
 	batch []entry
 	err   error
-	done  chan struct{}
+	done  chan struct{} // closed when the batch is committed
+	lead  chan struct{} // receives a token when this writer must lead the next round
 }
 
 func Open(dir string, opts *Options) (*DB, error) {
@@ -259,37 +260,48 @@ func (db *DB) Delete(key []byte) error {
 // first one becomes the leader and commits everything queued so far with a
 // single WAL write and a single fsync, then wakes the others. While the
 // leader is in fsync, new writers accumulate for the next round.
+//
+// A leader runs exactly one round (which includes its own batch) and then
+// hands leadership to the oldest queued writer. Looping until the queue is
+// empty would starve the leader's own caller under continuous load.
 func (db *DB) write(batch []entry) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	req := &writeReq{batch: batch, done: make(chan struct{})}
+	req := &writeReq{batch: batch, done: make(chan struct{}), lead: make(chan struct{}, 1)}
 	db.qmu.Lock()
 	db.queue = append(db.queue, req)
 	if db.leading {
 		db.qmu.Unlock()
-		<-req.done
-		return req.err
-	}
-	db.leading = true
-	db.qmu.Unlock()
-	for {
-		db.qmu.Lock()
-		reqs := db.queue
-		db.queue = nil
-		if len(reqs) == 0 {
-			db.leading = false
-			db.qmu.Unlock()
-			break
+		select {
+		case <-req.done: // committed by another leader
+			return req.err
+		case <-req.lead: // promoted: our batch is still queued
 		}
+	} else {
+		db.leading = true
 		db.qmu.Unlock()
-		err := db.commit(reqs)
-		for _, r := range reqs {
-			r.err = err
-			close(r.done)
-		}
 	}
-	<-req.done
+
+	db.qmu.Lock()
+	reqs := db.queue
+	db.queue = nil
+	db.qmu.Unlock()
+	err := db.commit(reqs)
+	for _, r := range reqs {
+		r.err = err
+		close(r.done)
+	}
+
+	db.qmu.Lock()
+	if len(db.queue) > 0 {
+		next := db.queue[0] // leadership stays "taken" and moves to next
+		db.qmu.Unlock()
+		next.lead <- struct{}{}
+	} else {
+		db.leading = false
+		db.qmu.Unlock()
+	}
 	return req.err
 }
 

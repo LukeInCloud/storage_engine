@@ -192,3 +192,44 @@ func TestReadsHitCache(t *testing.T) {
 		t.Fatal("cache stayed empty after reads")
 	}
 }
+
+// Under continuous concurrent load every single write must complete in
+// bounded time: a group-commit leader must not be kept busy serving others
+// while its own caller waits.
+func TestGroupCommitNoStarvation(t *testing.T) {
+	db, err := Open(t.TempDir(), &Options{}) // fsync on
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	stop := time.Now().Add(2 * time.Second)
+	var mu sync.Mutex
+	var worst time.Duration
+	var total int
+	var wg sync.WaitGroup
+	for w := 0; w < 24; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; time.Now().Before(stop); i++ {
+				t0 := time.Now()
+				if err := db.Put([]byte(fmt.Sprintf("w%02d-%06d", w, i)), []byte("v")); err != nil {
+					t.Error(err)
+					return
+				}
+				d := time.Since(t0)
+				mu.Lock()
+				total++
+				if d > worst {
+					worst = d
+				}
+				mu.Unlock()
+			}
+		}(w)
+	}
+	wg.Wait()
+	t.Logf("%d writes, worst latency %v", total, worst)
+	if worst > 750*time.Millisecond {
+		t.Fatalf("a write took %v under load: group-commit leader starvation", worst)
+	}
+}
