@@ -226,6 +226,27 @@ func (db *DB) BatchPut(keys, values [][]byte) error {
 	return db.write(batch)
 }
 
+// Op is one element of an atomic mixed batch.
+type Op struct {
+	Key, Value []byte
+	Delete     bool
+}
+
+// Write applies puts and deletes atomically (one WAL record).
+func (db *DB) Write(ops []Op) error {
+	batch := make([]entry, len(ops))
+	for i, o := range ops {
+		if len(o.Key) == 0 {
+			return ErrEmptyKey
+		}
+		batch[i] = entry{key: o.Key, value: o.Value, kind: kindPut}
+		if o.Delete {
+			batch[i] = entry{key: o.Key, kind: kindDelete}
+		}
+	}
+	return db.write(batch)
+}
+
 // Delete writes a tombstone. Deleting a missing key is not an error.
 func (db *DB) Delete(key []byte) error {
 	if len(key) == 0 {
@@ -468,9 +489,22 @@ func (db *DB) Read(key []byte) ([]byte, error) {
 // ReadKeyRange returns all live pairs with start <= key <= end in key order.
 // A nil start means "from the first key"; a nil end means "to the last key".
 func (db *DB) ReadKeyRange(start, end []byte) ([]KV, error) {
+	kvs, _, err := db.scan(start, end, 0)
+	return kvs, err
+}
+
+// Scan returns live pairs with key >= start in key order, stopping once about
+// maxBytes of keys+values were collected (at least one pair is returned if any
+// exist). more reports whether pairs remain; continue from lastKey+"\x00".
+// It lets callers stream a dataset larger than RAM.
+func (db *DB) Scan(start []byte, maxBytes int) (kvs []KV, more bool, err error) {
+	return db.scan(start, nil, maxBytes)
+}
+
+func (db *DB) scan(start, end []byte, maxBytes int) ([]KV, bool, error) {
 	s, err := db.snapshot()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer s.release()
 	srcs := []iterator{s.mem.iter(start)}
@@ -482,16 +516,22 @@ func (db *DB) ReadKeyRange(start, end []byte) ([]KV, error) {
 	}
 	m := newMergeIter(srcs)
 	var out []KV
+	size := 0
 	for ; m.Valid(); m.Next() {
 		e := m.Entry()
 		if end != nil && bytes.Compare(e.key, end) > 0 {
 			break
 		}
-		if e.kind == kindPut {
-			out = append(out, KV{bytes.Clone(e.key), bytes.Clone(e.value)})
+		if e.kind != kindPut {
+			continue
 		}
+		if maxBytes > 0 && len(out) > 0 && size >= maxBytes {
+			return out, true, m.Err()
+		}
+		out = append(out, KV{bytes.Clone(e.key), bytes.Clone(e.value)})
+		size += len(e.key) + len(e.value)
 	}
-	return out, m.Err()
+	return out, false, m.Err()
 }
 
 // ---- lifecycle ----

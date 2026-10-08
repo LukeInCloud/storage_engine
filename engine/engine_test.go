@@ -309,3 +309,44 @@ func BenchmarkRandomPut(b *testing.B) {
 		db.Put([]byte(fmt.Sprintf("%016x", rnd.Uint64())), val)
 	}
 }
+
+func TestWriteMixedBatchAndScan(t *testing.T) {
+	db := open(t, t.TempDir(), 2<<10)
+	defer db.Close()
+	for i := 0; i < 300; i++ {
+		db.Put([]byte(fmt.Sprintf("k%04d", i)), make([]byte, 20))
+	}
+	err := db.Write([]Op{
+		{Key: []byte("k0001"), Delete: true},
+		{Key: []byte("new"), Value: []byte("v")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMiss(t, db, "k0001")
+	mustRead(t, db, "new", "v")
+
+	// Stream everything in small pages and compare to the full range.
+	var paged []KV
+	cursor := []byte(nil)
+	for {
+		kvs, more, err := db.Scan(cursor, 200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paged = append(paged, kvs...)
+		if !more {
+			break
+		}
+		cursor = append(append([]byte{}, kvs[len(kvs)-1].Key...), 0)
+	}
+	all, _ := db.ReadKeyRange(nil, nil)
+	if len(paged) != len(all) {
+		t.Fatalf("paged %d vs full %d", len(paged), len(all))
+	}
+	for i := range all {
+		if string(paged[i].Key) != string(all[i].Key) {
+			t.Fatalf("mismatch at %d", i)
+		}
+	}
+}
