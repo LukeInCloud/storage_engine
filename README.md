@@ -75,7 +75,8 @@ Useful server flags: `-nosync` (unsafe: no fsync), `-stats 10s` (engine counters
   after an acknowledged write sees it, also across leader changes.
 * **Failover:** followers answer `NotLeader` with the leader's client address;
   the cluster client follows it, rotates on connection failure and retries with
-  backoff. Typical failover on localhost: ~0.5–1.5 s.
+  backoff. Measured failover after `kill -9` of the leader on localhost: ~1.6 s
+  (election timeout 400–800 ms by default plus client backoff).
 * **Ranges:** `ReadKeyRange(start, end)` is inclusive on both ends; `nil` bound
   = open. Keys must be non-empty; keys beginning with `\x00raft/` are reserved.
 * Client retries can apply a write twice if the first attempt's outcome was
