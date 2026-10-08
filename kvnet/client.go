@@ -12,32 +12,53 @@ import (
 )
 
 // Client is safe for concurrent use; calls on one Client are serialised over a
-// single connection (use several Clients for parallelism). A broken connection
-// is re-dialled on the next call; the failed call itself is not retried.
+// single connection (use several Clients for parallelism).
+//
+// A Client made by Dial talks to one server: a broken connection is
+// re-dialled on the next call and the failed call is not retried. A Client
+// made by DialCluster knows all nodes of a replicated cluster: it follows
+// not-leader redirects, rotates to the next node when one is unreachable and
+// retries with backoff for up to retryFor. Retrying can apply a write twice
+// if the first attempt's outcome was unknown; all operations here are
+// idempotent (last write wins), so this is safe unless clients race on a key.
 type Client struct {
-	addr    string
-	timeout time.Duration
+	timeout  time.Duration
+	retryFor time.Duration
 
-	mu   sync.Mutex
-	conn net.Conn
-	r    *bufio.Reader
-	w    *bufio.Writer
+	mu    sync.Mutex
+	addrs []string
+	cur   int
+	conn  net.Conn
+	r     *bufio.Reader
+	w     *bufio.Writer
 }
 
-// Dial connects to addr. timeout bounds every request (0 = 10s).
+// Dial connects to a single server. timeout bounds every request (0 = 10s).
 func Dial(addr string, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	c := &Client{addr: addr, timeout: timeout}
+	c := &Client{addrs: []string{addr}, timeout: timeout}
 	if err := c.connect(); err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
+// DialCluster creates a leader-following client for a replicated cluster.
+// Connections are made lazily, so some nodes may be down.
+func DialCluster(addrs []string, timeout, retryFor time.Duration) (*Client, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("kvnet: no addresses")
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return &Client{addrs: append([]string(nil), addrs...), timeout: timeout, retryFor: retryFor}, nil
+}
+
 func (c *Client) connect() error {
-	conn, err := net.DialTimeout("tcp", c.addr, c.timeout)
+	conn, err := net.DialTimeout("tcp", c.addrs[c.cur], c.timeout)
 	if err != nil {
 		return err
 	}
@@ -61,10 +82,68 @@ func (c *Client) Close() error {
 	return err
 }
 
+func (c *Client) dropConn() {
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+}
+
+// rotate moves on to the next known node.
+func (c *Client) rotate() {
+	c.dropConn()
+	c.cur = (c.cur + 1) % len(c.addrs)
+}
+
+// follow switches to the leader a node pointed us at (or rotates if unknown).
+func (c *Client) follow(addr string) {
+	if addr == "" {
+		c.rotate()
+		return
+	}
+	for i, a := range c.addrs {
+		if a == addr {
+			if i != c.cur {
+				c.dropConn()
+				c.cur = i
+			}
+			return
+		}
+	}
+	c.dropConn()
+	c.addrs = append(c.addrs, addr)
+	c.cur = len(c.addrs) - 1
+}
+
 // do sends one request and returns the response status and body.
 func (c *Client) do(req []byte) (byte, []byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	deadline := time.Now().Add(c.retryFor)
+	backoff := 20 * time.Millisecond
+	for {
+		st, body, err := c.attempt(req)
+		retry := false
+		switch {
+		case err != nil:
+			c.rotate()
+			retry = true
+		case st == stNotLeader:
+			d := &dec{b: body}
+			c.follow(string(d.bytes()))
+			retry = true
+		}
+		if !retry || c.retryFor == 0 || !time.Now().Add(backoff).Before(deadline) {
+			return st, body, err
+		}
+		time.Sleep(backoff)
+		if backoff *= 2; backoff > 500*time.Millisecond {
+			backoff = 500 * time.Millisecond
+		}
+	}
+}
+
+func (c *Client) attempt(req []byte) (byte, []byte, error) {
 	if c.conn == nil {
 		if err := c.connect(); err != nil {
 			return 0, nil, err
@@ -73,13 +152,11 @@ func (c *Client) do(req []byte) (byte, []byte, error) {
 	c.conn.SetDeadline(time.Now().Add(c.timeout))
 	resp, err := c.roundTrip(req)
 	if err != nil {
-		c.conn.Close()
-		c.conn = nil
+		c.dropConn()
 		return 0, nil, err
 	}
 	if len(resp) == 0 {
-		c.conn.Close()
-		c.conn = nil
+		c.dropConn()
 		return 0, nil, errMalformed
 	}
 	return resp[0], resp[1:], nil

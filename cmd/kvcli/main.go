@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"kvstore/engine"
@@ -15,7 +16,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:7000", "server address")
+	addr := flag.String("addr", "127.0.0.1:7000", "server address, or comma-separated list for a cluster")
 	flag.Parse()
 	a := flag.Args()
 	fail := func(err error) {
@@ -26,7 +27,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: kvcli put|get|del|range|batch ...")
 		os.Exit(2)
 	}
-	c, err := kvnet.Dial(*addr, 10*time.Second)
+	var c *kvnet.Client
+	var err error
+	if strings.Contains(*addr, ",") {
+		c, err = kvnet.DialCluster(strings.Split(*addr, ","), 10*time.Second, 15*time.Second)
+	} else {
+		c, err = kvnet.Dial(*addr, 10*time.Second)
+	}
 	if err != nil {
 		fail(err)
 	}
