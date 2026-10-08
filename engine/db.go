@@ -1,6 +1,7 @@
 // Package engine is a persistent, sorted key/value storage engine built as an
 // LSM tree: WAL -> memtable -> immutable SSTables, with a manifest tying the
-// files together. This is step 1: the single-node engine (no compaction yet).
+// files together, size-tiered background compaction, group commit and a block
+// cache.
 package engine
 
 import (
@@ -27,6 +28,12 @@ type Options struct {
 	// NoSync disables fsync on every write. Faster, but a power loss may drop
 	// recent writes. Default (false) = every acknowledged write is durable.
 	NoSync bool
+	// BlockCacheSize is the capacity in bytes of the decoded-block LRU cache.
+	// Default 32 MiB; negative disables the cache.
+	BlockCacheSize int
+	// CompactionTrigger is the number of SSTables that triggers a merge of that
+	// many adjacent tables. Default 4; negative disables compaction.
+	CompactionTrigger int
 }
 
 type KV struct{ Key, Value []byte }
@@ -35,7 +42,13 @@ type DB struct {
 	dir  string
 	opts Options
 
-	writeMu sync.Mutex // serialises writers (WAL append order == memtable order)
+	writeMu sync.Mutex // held while a commit group is applied; also by Close
+
+	qmu     sync.Mutex // group commit queue
+	queue   []*writeReq
+	leading bool
+
+	cache *blockCache
 
 	mu      sync.RWMutex // guards the fields below
 	cond    *sync.Cond   // signalled when imm is flushed or on failure
@@ -49,18 +62,33 @@ type DB struct {
 	closed  bool
 	failed  error
 
-	flushCh chan struct{}
-	wg      sync.WaitGroup
+	flushCh   chan struct{}
+	compactCh chan struct{}
+	flushWG   sync.WaitGroup
+	compactWG sync.WaitGroup
+}
+
+type writeReq struct {
+	batch []entry
+	err   error
+	done  chan struct{}
 }
 
 func Open(dir string, opts *Options) (*DB, error) {
-	db := &DB{dir: dir, flushCh: make(chan struct{}, 1)}
+	db := &DB{dir: dir, flushCh: make(chan struct{}, 1), compactCh: make(chan struct{}, 1)}
 	if opts != nil {
 		db.opts = *opts
 	}
 	if db.opts.MemtableSize <= 0 {
 		db.opts.MemtableSize = 4 << 20
 	}
+	if db.opts.BlockCacheSize == 0 {
+		db.opts.BlockCacheSize = 32 << 20
+	}
+	if db.opts.CompactionTrigger == 0 {
+		db.opts.CompactionTrigger = 4
+	}
+	db.cache = newBlockCache(db.opts.BlockCacheSize)
 	db.cond = sync.NewCond(&db.mu)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -69,8 +97,11 @@ func Open(dir string, opts *Options) (*DB, error) {
 		db.closeFiles()
 		return nil, err
 	}
-	db.wg.Add(1)
+	db.flushWG.Add(1)
 	go db.flushLoop()
+	db.compactWG.Add(1)
+	go db.compactLoop()
+	db.kickCompaction()
 	return db, nil
 }
 
@@ -120,7 +151,7 @@ func (db *DB) recover() error {
 		}
 	}
 	for _, id := range man.tables {
-		t, err := openSSTable(sstPath(db.dir, id), id)
+		t, err := openSSTable(sstPath(db.dir, id), id, db.cache)
 		if err != nil {
 			return err
 		}
@@ -150,7 +181,7 @@ func (db *DB) recover() error {
 		// Persist recovered data right away so old WALs can be dropped.
 		id := db.nextNum
 		db.nextNum++
-		t, err := writeTable(db.dir, id, replayed.iter(nil))
+		t, err := writeTable(db.dir, id, replayed.iter(nil), db.cache)
 		if err != nil {
 			return err
 		}
@@ -203,17 +234,61 @@ func (db *DB) Delete(key []byte) error {
 	return db.write([]entry{{key: key, kind: kindDelete}})
 }
 
+// write implements group commit. Concurrent writers queue their batch; the
+// first one becomes the leader and commits everything queued so far with a
+// single WAL write and a single fsync, then wakes the others. While the
+// leader is in fsync, new writers accumulate for the next round.
 func (db *DB) write(batch []entry) error {
 	if len(batch) == 0 {
 		return nil
 	}
+	req := &writeReq{batch: batch, done: make(chan struct{})}
+	db.qmu.Lock()
+	db.queue = append(db.queue, req)
+	if db.leading {
+		db.qmu.Unlock()
+		<-req.done
+		return req.err
+	}
+	db.leading = true
+	db.qmu.Unlock()
+	for {
+		db.qmu.Lock()
+		reqs := db.queue
+		db.queue = nil
+		if len(reqs) == 0 {
+			db.leading = false
+			db.qmu.Unlock()
+			break
+		}
+		db.qmu.Unlock()
+		err := db.commit(reqs)
+		for _, r := range reqs {
+			r.err = err
+			close(r.done)
+		}
+	}
+	<-req.done
+	return req.err
+}
+
+func (db *DB) memFull() bool { return db.mem.approxSize() >= db.opts.MemtableSize }
+
+// stalled reports that compaction is too far behind. Caller holds db.mu.
+func (db *DB) stalled() bool {
+	n := db.compactTrigger()
+	return n >= 2 && len(db.tables) >= 4*n
+}
+
+func (db *DB) commit(reqs []*writeReq) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 
-	// Backpressure: if the memtable is full and the previous one is still
-	// being flushed, wait instead of growing without bound.
+	// Backpressure keeps latency predictable: when the memtable is full, wait
+	// for the previous flush and for compaction to catch up rather than let
+	// memory or the number of files (read cost) grow without bound.
 	db.mu.Lock()
-	for !db.closed && db.failed == nil && db.imm != nil && db.mem.approxSize() >= db.opts.MemtableSize {
+	for !db.closed && db.failed == nil && db.memFull() && (db.imm != nil || db.stalled()) {
 		db.cond.Wait()
 	}
 	if db.closed {
@@ -227,17 +302,23 @@ func (db *DB) write(batch []entry) error {
 	}
 	db.mu.Unlock()
 
-	if db.mem.approxSize() >= db.opts.MemtableSize {
+	if db.memFull() {
 		if err := db.rotate(); err != nil {
 			return db.fail(err)
 		}
 	}
-	if err := db.wal.append(batch); err != nil {
+	batches := make([][]entry, len(reqs))
+	for i, r := range reqs {
+		batches[i] = r.batch
+	}
+	if err := db.wal.append(batches...); err != nil {
 		// A partial record may sit in the log; refuse further writes.
 		return db.fail(err)
 	}
-	for _, e := range batch {
-		db.mem.put(e.key, e.value, e.kind)
+	for _, b := range batches {
+		for _, e := range b {
+			db.mem.put(e.key, e.value, e.kind)
+		}
 	}
 	return nil
 }
@@ -275,8 +356,15 @@ func (db *DB) rotate() error {
 	return nil
 }
 
+func (db *DB) kickCompaction() {
+	select {
+	case db.compactCh <- struct{}{}:
+	default:
+	}
+}
+
 func (db *DB) flushLoop() {
-	defer db.wg.Done()
+	defer db.flushWG.Done()
 	for range db.flushCh {
 		if err := db.flushImm(); err != nil {
 			db.fail(err)
@@ -296,7 +384,7 @@ func (db *DB) flushImm() error {
 	liveWAL := db.wal.num // WAL paired with the current memtable
 	db.mu.Unlock()
 
-	t, err := writeTable(db.dir, id, imm.iter(nil))
+	t, err := writeTable(db.dir, id, imm.iter(nil), db.cache)
 	if err != nil {
 		return err
 	}
@@ -311,6 +399,7 @@ func (db *DB) flushImm() error {
 	db.imm, db.immWAL = nil, nil
 	db.cond.Broadcast()
 	db.mu.Unlock()
+	db.kickCompaction()
 
 	oldWAL.close()
 	os.Remove(walPath(db.dir, oldWAL.num))
@@ -321,7 +410,13 @@ func (db *DB) flushImm() error {
 
 type snapshot struct {
 	mem, imm *memtable
-	tables   []*sstable
+	tables   []*sstable // referenced; call release when done
+}
+
+func (s snapshot) release() {
+	for _, t := range s.tables {
+		t.unref()
+	}
 }
 
 func (db *DB) snapshot() (snapshot, error) {
@@ -330,7 +425,11 @@ func (db *DB) snapshot() (snapshot, error) {
 	if db.closed {
 		return snapshot{}, ErrClosed
 	}
-	return snapshot{db.mem, db.imm, db.tables[:len(db.tables):len(db.tables)]}, nil
+	tables := append([]*sstable(nil), db.tables...)
+	for _, t := range tables {
+		t.ref()
+	}
+	return snapshot{db.mem, db.imm, tables}, nil
 }
 
 // Read returns the value for key or ErrNotFound.
@@ -339,6 +438,7 @@ func (db *DB) Read(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer s.release()
 	found := func(e entry) ([]byte, error) {
 		if e.kind == kindDelete {
 			return nil, ErrNotFound
@@ -372,6 +472,7 @@ func (db *DB) ReadKeyRange(start, end []byte) ([]KV, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer s.release()
 	srcs := []iterator{s.mem.iter(start)}
 	if s.imm != nil {
 		srcs = append(srcs, s.imm.iter(start))
@@ -409,7 +510,9 @@ func (db *DB) Close() error {
 	db.cond.Broadcast()
 	db.mu.Unlock()
 	close(db.flushCh)
-	db.wg.Wait()
+	db.flushWG.Wait()
+	close(db.compactCh)
+	db.compactWG.Wait()
 	return db.closeFiles()
 }
 
@@ -424,7 +527,7 @@ func (db *DB) closeFiles() error {
 		keep(db.wal.close())
 	}
 	for _, t := range db.tables {
-		keep(t.close())
+		t.unref()
 	}
 	return first
 }

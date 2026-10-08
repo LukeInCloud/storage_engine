@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 )
 
 // File layout:
@@ -138,7 +139,7 @@ func (w *sstWriter) finish() error {
 func (w *sstWriter) abort() { w.f.Close() }
 
 // writeTable drains it into a new durable SSTable and opens it.
-func writeTable(dir string, id uint64, it iterator) (*sstable, error) {
+func writeTable(dir string, id uint64, it iterator, cache *blockCache) (*sstable, error) {
 	path := sstPath(dir, id)
 	w, err := newSSTWriter(path)
 	if err != nil {
@@ -164,19 +165,27 @@ func writeTable(dir string, id uint64, it iterator) (*sstable, error) {
 	if err := syncDir(dir); err != nil {
 		return nil, err
 	}
-	return openSSTable(path, id)
+	return openSSTable(path, id, cache)
 }
 
 // ---- reader ----
 
+// sstable is an immutable file. It is reference counted: the DB owns one
+// reference and every reader/compaction takes another, so a file replaced by
+// compaction is closed and deleted only after the last reader is done.
 type sstable struct {
-	f     *os.File
-	id    uint64
-	index []indexEntry
-	bloom []byte
+	f        *os.File
+	path     string
+	id       uint64
+	size     int64
+	index    []indexEntry
+	bloom    []byte
+	cache    *blockCache
+	refs     atomic.Int32
+	obsolete atomic.Bool
 }
 
-func openSSTable(path string, id uint64) (*sstable, error) {
+func openSSTable(path string, id uint64, cache *blockCache) (*sstable, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -186,6 +195,8 @@ func openSSTable(path string, id uint64) (*sstable, error) {
 		f.Close()
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	t.path, t.cache = path, cache
+	t.refs.Store(1)
 	return t, nil
 }
 
@@ -212,7 +223,7 @@ func loadSSTable(f *os.File, id uint64) (*sstable, error) {
 	if indexOff+indexLen > limit || bloomOff+bloomLen > limit {
 		return nil, errCorrupt
 	}
-	t := &sstable{f: f, id: id}
+	t := &sstable{f: f, id: id, size: st.Size()}
 	t.bloom = make([]byte, bloomLen)
 	if _, err := f.ReadAt(t.bloom, int64(bloomOff)); err != nil {
 		return nil, err
@@ -247,9 +258,24 @@ func loadSSTable(f *os.File, id uint64) (*sstable, error) {
 	return t, nil
 }
 
-func (t *sstable) close() error { return t.f.Close() }
+func (t *sstable) ref() { t.refs.Add(1) }
 
-func (t *sstable) readBlock(i int) ([]entry, error) {
+func (t *sstable) unref() {
+	if t.refs.Add(-1) == 0 {
+		t.f.Close()
+		if t.obsolete.Load() {
+			os.Remove(t.path)
+		}
+	}
+}
+
+// readBlock returns the decoded block; the result is shared (cache) and must
+// not be modified. fill=false (compaction scans) avoids evicting hot blocks.
+func (t *sstable) readBlock(i int, fill bool) ([]entry, error) {
+	key := cacheKey{t.id, i}
+	if ents, ok := t.cache.get(key); ok {
+		return ents, nil
+	}
 	ie := t.index[i]
 	buf := make([]byte, ie.len)
 	if _, err := t.f.ReadAt(buf, int64(ie.off)); err != nil {
@@ -267,6 +293,9 @@ func (t *sstable) readBlock(i int) ([]entry, error) {
 		}
 		ents = append(ents, e)
 		body = body[n:]
+	}
+	if fill {
+		t.cache.put(key, ents, int(ie.len))
 	}
 	return ents, nil
 }
@@ -286,7 +315,7 @@ func (t *sstable) get(key []byte) (entry, bool, error) {
 	if b < 0 {
 		return entry{}, false, nil
 	}
-	ents, err := t.readBlock(b)
+	ents, err := t.readBlock(b, true)
 	if err != nil {
 		return entry{}, false, err
 	}
@@ -298,6 +327,7 @@ func (t *sstable) get(key []byte) (entry, bool, error) {
 }
 
 type sstIter struct {
+	fill bool
 	t    *sstable
 	bi   int
 	ents []entry
@@ -305,8 +335,10 @@ type sstIter struct {
 	err  error
 }
 
-func (t *sstable) iter(start []byte) *sstIter {
-	it := &sstIter{t: t}
+func (t *sstable) iter(start []byte) *sstIter { return t.iterOpt(start, true) }
+
+func (t *sstable) iterOpt(start []byte, fill bool) *sstIter {
+	it := &sstIter{t: t, fill: fill}
 	if start != nil {
 		if b := t.blockFor(start); b > 0 {
 			it.bi = b
@@ -327,7 +359,7 @@ func (it *sstIter) loadNext() {
 		if it.bi >= len(it.t.index) {
 			return
 		}
-		ents, err := it.t.readBlock(it.bi)
+		ents, err := it.t.readBlock(it.bi, it.fill)
 		if err != nil {
 			it.err = err
 			return

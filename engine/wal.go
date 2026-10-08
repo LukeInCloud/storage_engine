@@ -37,16 +37,21 @@ func createWAL(dir string, num uint64, sync bool) (*wal, error) {
 	return &wal{f: f, num: num, sync: sync}, nil
 }
 
-func (w *wal) append(batch []entry) error {
+// append writes one record per batch with a single write and a single fsync
+// (group commit). Each record stays individually atomic.
+func (w *wal) append(batches ...[]entry) error {
 	buf := w.buf[:0]
-	buf = append(buf, make([]byte, walHeaderSize)...)
-	buf = binary.AppendUvarint(buf, uint64(len(batch)))
-	for _, e := range batch {
-		buf = appendEntry(buf, e)
+	for _, batch := range batches {
+		start := len(buf)
+		buf = append(buf, make([]byte, walHeaderSize)...)
+		buf = binary.AppendUvarint(buf, uint64(len(batch)))
+		for _, e := range batch {
+			buf = appendEntry(buf, e)
+		}
+		payload := buf[start+walHeaderSize:]
+		binary.LittleEndian.PutUint32(buf[start:], uint32(len(payload)))
+		binary.LittleEndian.PutUint32(buf[start+4:], crc32.Checksum(payload, castagnoli))
 	}
-	payload := buf[walHeaderSize:]
-	binary.LittleEndian.PutUint32(buf[0:], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(buf[4:], crc32.Checksum(payload, castagnoli))
 	w.buf = buf
 	if _, err := w.f.Write(buf); err != nil {
 		return err

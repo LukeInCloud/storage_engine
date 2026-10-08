@@ -20,6 +20,16 @@ func open(t testing.TB, dir string, memSize int) *DB {
 	return db
 }
 
+func openOpts(t testing.TB, dir string, o Options) *DB {
+	t.Helper()
+	o.NoSync = true
+	db, err := Open(dir, &o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
 func mustRead(t *testing.T, db *DB, k string, want string) {
 	t.Helper()
 	got, err := db.Read([]byte(k))
@@ -159,7 +169,7 @@ func TestOrphanFilesCleanedUp(t *testing.T) {
 // over many SSTables, and with restarts in between.
 func TestRandomAgainstModel(t *testing.T) {
 	dir := t.TempDir()
-	db := open(t, dir, 8<<10)
+	db := openOpts(t, dir, Options{MemtableSize: 8 << 10, CompactionTrigger: -1})
 	model := map[string]string{}
 	rnd := rand.New(rand.NewSource(42))
 
@@ -232,7 +242,7 @@ func TestRandomAgainstModel(t *testing.T) {
 		}
 		check()
 		db.Close()
-		db = open(t, dir, 8<<10)
+		db = openOpts(t, dir, Options{MemtableSize: 8 << 10, CompactionTrigger: -1})
 		check()
 	}
 	db.Close()
