@@ -40,7 +40,8 @@ func crashKey(i int) string { return fmt.Sprintf("key-%07d", i) }
 
 func crashWriter(dir string) {
 	start, _ := strconv.Atoi(os.Getenv("ENGINE_CRASH_START"))
-	db, err := Open(dir, &Options{MemtableSize: 16 << 10, CompactionTrigger: 3}) // fsync on
+	// Tiny sizes so kills also land inside multi-level compactions. fsync is on.
+	db, err := Open(dir, &Options{MemtableSize: 16 << 10, CompactionTrigger: 3, TargetFileSize: 24 << 10, LevelBaseBytes: 64 << 10})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open:", err)
 		os.Exit(3)

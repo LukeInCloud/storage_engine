@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -25,11 +26,48 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// small sizes so that data cascades through several levels in a short test
+func levelOpts() Options {
+	return Options{MemtableSize: 4 << 10, CompactionTrigger: 3, TargetFileSize: 8 << 10, LevelBaseBytes: 16 << 10}
+}
+
+// liveTables returns the tables of the current version.
+func liveTables(db *DB) (n int, ids map[uint64]bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	ids = map[uint64]bool{}
+	for _, files := range db.cur.levels {
+		for _, t := range files {
+			ids[t.id] = true
+			n++
+		}
+	}
+	return n, ids
+}
+
+// rawEntries counts every stored entry (live, overwritten and tombstones) in all tables.
+func rawEntries(t *testing.T, db *DB) (total, tombstones int) {
+	t.Helper()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	for _, files := range db.cur.levels {
+		for _, tb := range files {
+			for it := tb.iterOpt(nil, false); it.Valid(); it.Next() {
+				total++
+				if it.Entry().kind == kindDelete {
+					tombstones++
+				}
+			}
+		}
+	}
+	return
+}
+
 // Compaction must never change what reads return, while readers and writers
-// run concurrently, and it must keep the number of files bounded.
+// run concurrently; the level invariants must hold and data must cascade down.
 func TestCompactionPreservesData(t *testing.T) {
 	dir := t.TempDir()
-	o := Options{MemtableSize: 4 << 10, CompactionTrigger: 3}
+	o := levelOpts()
 	db := openOpts(t, dir, o)
 	model := map[string]string{}
 	var mu sync.Mutex
@@ -66,6 +104,11 @@ func TestCompactionPreservesData(t *testing.T) {
 			model[k] = v
 		}
 		mu.Unlock()
+		if i%2000 == 0 {
+			if err := db.checkLevels(); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	close(stop)
 	rd.Wait()
@@ -87,38 +130,108 @@ func TestCompactionPreservesData(t *testing.T) {
 		for k, v := range model {
 			mustRead(t, db, k, v)
 		}
+		if err := db.checkLevels(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	verify(db)
-	waitFor(t, "compaction to settle", func() bool { return countSST(dir) < 3 })
+	waitFor(t, "level 0 to drain", func() bool { return db.levelFiles()[0] < o.CompactionTrigger })
 	verify(db)
+	if lf := db.levelFiles(); lf[2] == 0 {
+		t.Fatalf("data never cascaded below level 1: %v", lf)
+	}
 	db.Close()
 	db = openOpts(t, dir, o)
 	defer db.Close()
 	verify(db)
 }
 
-func TestCompactionDropsTombstonesAndObsoleteFiles(t *testing.T) {
+func TestCompactAllDropsTombstonesAndOldVersions(t *testing.T) {
 	dir := t.TempDir()
-	db := openOpts(t, dir, Options{MemtableSize: 1 << 10, CompactionTrigger: 2})
+	db := openOpts(t, dir, levelOpts())
 	defer db.Close()
-	for i := 0; i < 500; i++ {
-		db.Put([]byte(fmt.Sprintf("k%04d", i)), make([]byte, 50))
+	for round := 0; round < 5; round++ { // many overwritten versions per key
+		for i := 0; i < 300; i++ {
+			db.Put([]byte(fmt.Sprintf("k%04d", i)), []byte(fmt.Sprintf("round%d", round)))
+		}
 	}
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 300; i += 2 {
 		db.Delete([]byte(fmt.Sprintf("k%04d", i)))
 	}
-	// Push the tombstones through a few more flushes so everything merges.
-	for i := 0; i < 200; i++ {
-		db.Put([]byte(fmt.Sprintf("z%04d", i)), make([]byte, 50))
+	if err := db.CompactAll(); err != nil {
+		t.Fatal(err)
 	}
-	waitFor(t, "files to shrink", func() bool { return countSST(dir) <= 2 })
+	if err := db.checkLevels(); err != nil {
+		t.Fatal(err)
+	}
+	total, tombs := rawEntries(t, db)
+	// The memtable may still hold a few recent entries, but the tables must be minimal.
+	if tombs != 0 || total > 150 {
+		t.Fatalf("after full compaction: %d entries, %d tombstones; want <=150 live and 0 tombstones", total, tombs)
+	}
 	got, _ := db.ReadKeyRange(nil, nil)
-	if len(got) != 200 {
-		t.Fatalf("expected 200 live keys, got %d", len(got))
+	if len(got) != 150 {
+		t.Fatalf("live keys = %d, want 150", len(got))
 	}
-	for i := 0; i < 500; i++ {
-		mustMiss(t, db, fmt.Sprintf("k%04d", i))
+	for _, kv := range got {
+		if string(kv.Value) != "round4" {
+			t.Fatalf("%s=%s; newest version must win", kv.Key, kv.Value)
+		}
 	}
+}
+
+// Sequential keys never overlap, so files can move down levels without being rewritten.
+func TestTrivialMovesKeepDataIntact(t *testing.T) {
+	dir := t.TempDir()
+	db := openOpts(t, dir, levelOpts())
+	defer db.Close()
+	for i := 0; i < 3000; i++ {
+		db.Put([]byte(fmt.Sprintf("seq-%06d", i)), []byte("payload-payload-payload"))
+	}
+	waitFor(t, "compaction", func() bool { return db.levelFiles()[0] < 3 })
+	if err := db.checkLevels(); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := db.ReadKeyRange(nil, nil)
+	if len(got) != 3000 {
+		t.Fatalf("lost keys: %d", len(got))
+	}
+}
+
+// Files replaced by compaction must be deleted from disk, but only once no
+// reader can still need them.
+func TestObsoleteFilesDeletedAfterLastReader(t *testing.T) {
+	dir := t.TempDir()
+	// A huge trigger: nothing compacts on its own, only the explicit CompactAll below.
+	db := openOpts(t, dir, Options{MemtableSize: 2 << 10, CompactionTrigger: 1000, TargetFileSize: 8 << 10})
+	defer db.Close()
+	for i := 0; i < 1500; i++ {
+		db.Put([]byte(fmt.Sprintf("k%05d", i%400)), make([]byte, 30))
+	}
+	waitFor(t, "flushes", func() bool { return db.levelFiles()[0] >= 4 })
+
+	snap, err := db.snapshot() // a reader that pins the current layout
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pinned := liveTables(db)
+	if err := db.CompactAll(); err != nil {
+		t.Fatal(err)
+	}
+	for id := range pinned {
+		if _, err := os.Stat(sstPath(dir, id)); err != nil {
+			t.Fatalf("table %06d deleted while a reader still pins it", id)
+		}
+	}
+	if _, _, err := snap.v.get([]byte("k00001")); err != nil {
+		t.Fatalf("pinned reader broken by compaction: %v", err)
+	}
+	snap.release()
+	_, live := liveTables(db)
+	waitFor(t, "obsolete files to disappear", func() bool {
+		m, _ := filepath.Glob(filepath.Join(dir, "*.sst"))
+		return len(m) == len(live)
+	})
 }
 
 // With fsync enabled, concurrent writers must share fsyncs (group commit):

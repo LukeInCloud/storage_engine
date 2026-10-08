@@ -18,11 +18,13 @@ import (
 //
 // A data block is a run of encoded entries (~blockSize bytes) in key order.
 // The index holds, per block, its first key, offset and length (incl. crc).
+// The index section also stores the largest key of the file (after the block
+// entries), so a table knows its key range [smallest, largest].
 // Footer (40 B): indexOff, indexLen, bloomOff, bloomLen, magic (u64 LE).
 const (
 	blockSize  = 4096
 	footerSize = 40
-	sstMagic   = 0x6b76737374303031
+	sstMagic   = 0x6b76737374303032
 )
 
 func sstPath(dir string, id uint64) string {
@@ -114,6 +116,8 @@ func (w *sstWriter) finish() error {
 		idx = binary.AppendUvarint(idx, ie.off)
 		idx = binary.AppendUvarint(idx, ie.len)
 	}
+	idx = binary.AppendUvarint(idx, uint64(len(w.lastKey)))
+	idx = append(idx, w.lastKey...)
 	indexOff := w.off
 	if err := w.write(idx); err != nil {
 		return err
@@ -138,6 +142,19 @@ func (w *sstWriter) finish() error {
 
 func (w *sstWriter) abort() { w.f.Close() }
 
+// size is the number of bytes this table will roughly occupy so far.
+func (w *sstWriter) size() int64 { return int64(w.off) + int64(len(w.block)) }
+
+// finishTable seals w and opens the resulting table.
+func finishTable(w *sstWriter, path string, id uint64, cache *blockCache) (*sstable, error) {
+	if err := w.finish(); err != nil {
+		w.abort()
+		os.Remove(path)
+		return nil, err
+	}
+	return openSSTable(path, id, cache)
+}
+
 // writeTable drains it into a new durable SSTable and opens it.
 func writeTable(dir string, id uint64, it iterator, cache *blockCache) (*sstable, error) {
 	path := sstPath(dir, id)
@@ -157,15 +174,15 @@ func writeTable(dir string, id uint64, it iterator, cache *blockCache) (*sstable
 		os.Remove(path)
 		return nil, err
 	}
-	if err := w.finish(); err != nil {
-		w.abort()
-		os.Remove(path)
+	t, err := finishTable(w, path, id, cache)
+	if err != nil {
 		return nil, err
 	}
 	if err := syncDir(dir); err != nil {
+		t.unref()
 		return nil, err
 	}
-	return openSSTable(path, id, cache)
+	return t, nil
 }
 
 // ---- reader ----
@@ -179,6 +196,8 @@ type sstable struct {
 	id       uint64
 	size     int64
 	index    []indexEntry
+	smallest []byte // key range of the file; nil if the table is empty
+	largest  []byte
 	bloom    []byte
 	cache    *blockCache
 	refs     atomic.Int32
@@ -254,6 +273,14 @@ func loadSSTable(f *os.File, id uint64) (*sstable, error) {
 		}
 		idx = idx[n:]
 		t.index = append(t.index, ie)
+	}
+	kl, n := binary.Uvarint(idx)
+	if n <= 0 || kl > uint64(len(idx)-n) {
+		return nil, errCorrupt
+	}
+	t.largest = bytes.Clone(idx[n : n+int(kl)])
+	if len(t.index) > 0 {
+		t.smallest = t.index[0].firstKey
 	}
 	return t, nil
 }

@@ -10,9 +10,12 @@ package main
 import (
 	"flag"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"kvstore/engine"
 	"kvstore/kvnet"
@@ -25,7 +28,12 @@ func main() {
 	noSync := flag.Bool("nosync", false, "disable engine fsync (faster, not crash-safe)")
 	id := flag.String("id", "", "this node's ID (cluster mode)")
 	peers := flag.String("peers", "", "cluster members: id=raftAddr/clientAddr,... (enables cluster mode)")
+	statsEvery := flag.Duration("stats", 0, "log engine statistics at this interval (standalone mode), e.g. 5s")
+	pprofAddr := flag.String("pprof", "", "serve net/http/pprof on this address (e.g. 127.0.0.1:6060)")
 	flag.Parse()
+	if *pprofAddr != "" {
+		go func() { log.Println(http.ListenAndServe(*pprofAddr, nil)) }()
+	}
 
 	if *peers == "" {
 		db, err := engine.Open(*dir, &engine.Options{NoSync: *noSync})
@@ -37,6 +45,13 @@ func main() {
 			log.Fatal(err)
 		}
 		log.Printf("standalone: serving %s on %s", *dir, srv.Addr())
+		if *statsEvery > 0 {
+			go func() {
+				for range time.Tick(*statsEvery) {
+					log.Printf("stats: %v", db.Stats())
+				}
+			}()
+		}
 		waitForSignal()
 		srv.Close()
 		db.Close()

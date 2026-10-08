@@ -11,13 +11,14 @@ import (
 
 // manifest is the single source of truth about which files make up the DB.
 //
-//	log N    WAL files numbered < N are fully flushed to SSTables
-//	table ID SSTables, oldest first (later tables shadow earlier ones)
+//	log N          WAL files numbered < N are fully flushed to SSTables
+//	table LEVEL ID SSTables per level; within level 0 oldest first (newer
+//	               files shadow older ones), in other levels any order
 //
 // It is replaced atomically (write temp, fsync, rename, fsync dir).
 type manifest struct {
 	logNum uint64
-	tables []uint64
+	levels [numLevels][]uint64
 }
 
 const manifestName = "MANIFEST"
@@ -30,8 +31,10 @@ func writeManifest(dir string, m manifest) error {
 	}
 	w := bufio.NewWriter(f)
 	fmt.Fprintf(w, "log %d\n", m.logNum)
-	for _, id := range m.tables {
-		fmt.Fprintf(w, "table %d\n", id)
+	for l, ids := range m.levels {
+		for _, id := range ids {
+			fmt.Fprintf(w, "table %d %d\n", l, id)
+		}
 	}
 	if err := w.Flush(); err != nil {
 		f.Close()
@@ -63,18 +66,24 @@ func readManifest(dir string) (manifest, error) {
 		if line == "" {
 			continue
 		}
-		kind, val, ok := strings.Cut(line, " ")
-		n, perr := strconv.ParseUint(val, 10, 64)
-		if !ok || perr != nil {
-			return m, fmt.Errorf("manifest: bad line %q", line)
-		}
-		switch kind {
-		case "log":
+		f := strings.Fields(line)
+		bad := fmt.Errorf("manifest: bad line %q", line)
+		switch {
+		case len(f) == 2 && f[0] == "log":
+			n, err := strconv.ParseUint(f[1], 10, 64)
+			if err != nil {
+				return m, bad
+			}
 			m.logNum = n
-		case "table":
-			m.tables = append(m.tables, n)
+		case len(f) == 3 && f[0] == "table":
+			l, err1 := strconv.Atoi(f[1])
+			id, err2 := strconv.ParseUint(f[2], 10, 64)
+			if err1 != nil || err2 != nil || l < 0 || l >= numLevels {
+				return m, bad
+			}
+			m.levels[l] = append(m.levels[l], id)
 		default:
-			return m, fmt.Errorf("manifest: bad line %q", line)
+			return m, bad
 		}
 	}
 	return m, nil

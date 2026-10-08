@@ -1,7 +1,7 @@
 // Package engine is a persistent, sorted key/value storage engine built as an
-// LSM tree: WAL -> memtable -> immutable SSTables, with a manifest tying the
-// files together, size-tiered background compaction, group commit and a block
-// cache.
+// LSM tree: WAL -> memtable -> immutable SSTables organised in levels, with a
+// manifest tying the files together, leveled background compaction with
+// bounded-size merges, group commit and a block cache.
 package engine
 
 import (
@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -31,9 +32,16 @@ type Options struct {
 	// BlockCacheSize is the capacity in bytes of the decoded-block LRU cache.
 	// Default 32 MiB; negative disables the cache.
 	BlockCacheSize int
-	// CompactionTrigger is the number of SSTables that triggers a merge of that
-	// many adjacent tables. Default 4; negative disables compaction.
+	// CompactionTrigger is the number of level-0 files that triggers a
+	// compaction into level 1. Writes are slowed down at twice this number and
+	// stopped at three times it. Default 4; negative disables compaction.
 	CompactionTrigger int
+	// TargetFileSize is the approximate size of SSTables produced by
+	// compaction. Default 8 MiB.
+	TargetFileSize int
+	// LevelBaseBytes is the capacity of level 1; each deeper level holds 10x
+	// more. Default 64 MiB.
+	LevelBaseBytes int64
 }
 
 type KV struct{ Key, Value []byte }
@@ -56,11 +64,18 @@ type DB struct {
 	imm     *memtable // being flushed, read-only
 	wal     *wal
 	immWAL  *wal
-	tables  []*sstable // oldest -> newest
+	cur     *version // current table layout
 	man     manifest
 	nextNum uint64
 	closed  bool
 	failed  error
+
+	ctr        counters
+	thr        throttle
+	quit       chan struct{} // closed by Close; stops auxiliary goroutines
+	bgWG       sync.WaitGroup
+	compactMu  sync.Mutex // one compaction (or CompactAll) at a time
+	compactPtr [numLevels][]byte
 
 	flushCh   chan struct{}
 	compactCh chan struct{}
@@ -76,7 +91,7 @@ type writeReq struct {
 }
 
 func Open(dir string, opts *Options) (*DB, error) {
-	db := &DB{dir: dir, flushCh: make(chan struct{}, 1), compactCh: make(chan struct{}, 1)}
+	db := &DB{dir: dir, flushCh: make(chan struct{}, 1), compactCh: make(chan struct{}, 1), quit: make(chan struct{})}
 	if opts != nil {
 		db.opts = *opts
 	}
@@ -88,6 +103,12 @@ func Open(dir string, opts *Options) (*DB, error) {
 	}
 	if db.opts.CompactionTrigger == 0 {
 		db.opts.CompactionTrigger = 4
+	}
+	if db.opts.TargetFileSize <= 0 {
+		db.opts.TargetFileSize = defaultTargetFileSize
+	}
+	if db.opts.LevelBaseBytes <= 0 {
+		db.opts.LevelBaseBytes = defaultLevelBase
 	}
 	db.cache = newBlockCache(db.opts.BlockCacheSize)
 	db.cond = sync.NewCond(&db.mu)
@@ -102,6 +123,8 @@ func Open(dir string, opts *Options) (*DB, error) {
 	go db.flushLoop()
 	db.compactWG.Add(1)
 	go db.compactLoop()
+	db.bgWG.Add(1)
+	go db.throttleLoop()
 	db.kickCompaction()
 	return db, nil
 }
@@ -117,10 +140,12 @@ func (db *DB) recover() error {
 	}
 	inManifest := map[uint64]bool{}
 	maxNum := man.logNum
-	for _, id := range man.tables {
-		inManifest[id] = true
-		if id > maxNum {
-			maxNum = id
+	for _, ids := range man.levels {
+		for _, id := range ids {
+			inManifest[id] = true
+			if id > maxNum {
+				maxNum = id
+			}
 		}
 	}
 	var walNums []uint64
@@ -151,12 +176,27 @@ func (db *DB) recover() error {
 			walNums = append(walNums, n)
 		}
 	}
-	for _, id := range man.tables {
-		t, err := openSSTable(sstPath(db.dir, id), id, db.cache)
-		if err != nil {
-			return err
+	var levels [numLevels][]*sstable
+	opened := func() {
+		for _, files := range levels {
+			for _, t := range files {
+				t.unref()
+			}
 		}
-		db.tables = append(db.tables, t)
+	}
+	for l, ids := range man.levels {
+		for _, id := range ids {
+			t, err := openSSTable(sstPath(db.dir, id), id, db.cache)
+			if err != nil {
+				opened()
+				return err
+			}
+			levels[l] = append(levels[l], t)
+		}
+		if l > 0 {
+			files := levels[l]
+			sort.Slice(files, func(i, j int) bool { return bytes.Compare(files[i].smallest, files[j].smallest) < 0 })
+		}
 	}
 
 	// Replay WALs that were not yet flushed.
@@ -184,12 +224,14 @@ func (db *DB) recover() error {
 		db.nextNum++
 		t, err := writeTable(db.dir, id, replayed.iter(nil), db.cache)
 		if err != nil {
+			opened()
 			return err
 		}
-		db.tables = append(db.tables, t)
-		man.tables = append(man.tables, id)
+		levels[0] = append(levels[0], t)
 	}
-	man.logNum = walNum
+	db.cur = newVersion(levels)
+	opened() // the version now holds its own references
+	man = db.cur.manifest(walNum)
 	if err := writeManifest(db.dir, man); err != nil {
 		return err
 	}
@@ -309,20 +351,37 @@ func (db *DB) memFull() bool { return db.mem.approxSize() >= db.opts.MemtableSiz
 
 // stalled reports that compaction is too far behind. Caller holds db.mu.
 func (db *DB) stalled() bool {
-	n := db.compactTrigger()
-	return n >= 2 && len(db.tables) >= 4*n
+	return db.compactionEnabled() && len(db.cur.levels[0]) >= 3*db.opts.CompactionTrigger
 }
 
 func (db *DB) commit(reqs []*writeReq) error {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 
+	// Adaptive brake: admit bytes at the rate compaction can sustain, so the
+	// hard stall below is a last resort rather than the normal regulator.
+	size := 0
+	for _, r := range reqs {
+		for _, e := range r.batch {
+			size += len(e.key) + len(e.value)
+		}
+	}
+	if d := db.thr.wait(size); d > 0 {
+		db.ctr.slowdowns.Add(1)
+		db.ctr.slowdownNanos.Add(int64(d))
+	}
+
 	// Backpressure keeps latency predictable: when the memtable is full, wait
 	// for the previous flush and for compaction to catch up rather than let
 	// memory or the number of files (read cost) grow without bound.
 	db.mu.Lock()
-	for !db.closed && db.failed == nil && db.memFull() && (db.imm != nil || db.stalled()) {
-		db.cond.Wait()
+	if !db.closed && db.failed == nil && db.memFull() && (db.imm != nil || db.stalled()) {
+		t0 := time.Now()
+		for !db.closed && db.failed == nil && db.memFull() && (db.imm != nil || db.stalled()) {
+			db.cond.Wait()
+		}
+		db.ctr.stalls.Add(1)
+		db.ctr.stallNanos.Add(int64(time.Since(t0)))
 	}
 	if db.closed {
 		db.mu.Unlock()
@@ -353,6 +412,7 @@ func (db *DB) commit(reqs []*writeReq) error {
 			db.mem.put(e.key, e.value, e.kind)
 		}
 	}
+	db.ctr.writtenBytes.Add(int64(size))
 	return nil
 }
 
@@ -422,16 +482,17 @@ func (db *DB) flushImm() error {
 		return err
 	}
 	db.mu.Lock()
-	man := manifest{logNum: liveWAL, tables: append(append([]uint64(nil), db.man.tables...), id)}
-	if err := writeManifest(db.dir, man); err != nil {
+	var add [numLevels][]*sstable
+	add[0] = []*sstable{t}
+	if err := db.installVersion(db.cur.withChanges(nil, add), liveWAL, []*sstable{t}, nil, false); err != nil {
 		db.mu.Unlock()
 		return err
 	}
-	db.man = man
-	db.tables = append(db.tables, t)
 	db.imm, db.immWAL = nil, nil
 	db.cond.Broadcast()
 	db.mu.Unlock()
+	db.ctr.flushes.Add(1)
+	db.ctr.flushBytes.Add(t.size)
 	db.kickCompaction()
 
 	oldWAL.close()
@@ -443,14 +504,10 @@ func (db *DB) flushImm() error {
 
 type snapshot struct {
 	mem, imm *memtable
-	tables   []*sstable // referenced; call release when done
+	v        *version // pinned; call release when done
 }
 
-func (s snapshot) release() {
-	for _, t := range s.tables {
-		t.unref()
-	}
-}
+func (s snapshot) release() { s.v.unref() }
 
 func (db *DB) snapshot() (snapshot, error) {
 	db.mu.RLock()
@@ -458,11 +515,8 @@ func (db *DB) snapshot() (snapshot, error) {
 	if db.closed {
 		return snapshot{}, ErrClosed
 	}
-	tables := append([]*sstable(nil), db.tables...)
-	for _, t := range tables {
-		t.ref()
-	}
-	return snapshot{db.mem, db.imm, tables}, nil
+	db.cur.ref()
+	return snapshot{db.mem, db.imm, db.cur}, nil
 }
 
 // Read returns the value for key or ErrNotFound.
@@ -486,14 +540,12 @@ func (db *DB) Read(key []byte) ([]byte, error) {
 			return found(e)
 		}
 	}
-	for i := len(s.tables) - 1; i >= 0; i-- {
-		e, ok, err := s.tables[i].get(key)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			return found(e)
-		}
+	e, ok, err := s.v.get(key)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return found(e)
 	}
 	return nil, ErrNotFound
 }
@@ -523,9 +575,7 @@ func (db *DB) scan(start, end []byte, maxBytes int) ([]KV, bool, error) {
 	if s.imm != nil {
 		srcs = append(srcs, s.imm.iter(start))
 	}
-	for i := len(s.tables) - 1; i >= 0; i-- {
-		srcs = append(srcs, s.tables[i].iter(start))
-	}
+	srcs = append(srcs, s.v.iterators(start, true)...)
 	m := newMergeIter(srcs)
 	var out []KV
 	size := 0
@@ -546,6 +596,44 @@ func (db *DB) scan(start, end []byte, maxBytes int) ([]KV, bool, error) {
 	return out, false, m.Err()
 }
 
+// Flush writes the memtable to an SSTable and returns when it is durable in
+// the table layout (the WAL alone already guarantees durability; this is for
+// maintenance such as CompactAll).
+func (db *DB) Flush() error {
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	db.mu.Lock()
+	for !db.closed && db.failed == nil && db.imm != nil {
+		db.cond.Wait()
+	}
+	if db.closed {
+		db.mu.Unlock()
+		return ErrClosed
+	}
+	if db.failed != nil {
+		err := db.failed
+		db.mu.Unlock()
+		return err
+	}
+	empty := db.mem.len() == 0
+	db.mu.Unlock()
+	if empty {
+		return nil
+	}
+	if err := db.rotate(); err != nil {
+		return db.fail(err)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for !db.closed && db.failed == nil && db.imm != nil {
+		db.cond.Wait()
+	}
+	if db.failed != nil {
+		return db.failed
+	}
+	return nil
+}
+
 // ---- lifecycle ----
 
 // Close waits for a pending flush and releases all files. Unflushed memtable
@@ -561,6 +649,8 @@ func (db *DB) Close() error {
 	db.closed = true
 	db.cond.Broadcast()
 	db.mu.Unlock()
+	close(db.quit)
+	db.bgWG.Wait()
 	close(db.flushCh)
 	db.flushWG.Wait()
 	close(db.compactCh)
@@ -578,8 +668,8 @@ func (db *DB) closeFiles() error {
 	if db.wal != nil {
 		keep(db.wal.close())
 	}
-	for _, t := range db.tables {
-		t.unref()
+	if db.cur != nil {
+		db.cur.unref()
 	}
 	return first
 }
