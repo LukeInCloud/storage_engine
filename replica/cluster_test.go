@@ -311,6 +311,9 @@ func TestClusterSnapshotCatchUpWithRealEngine(t *testing.T) {
 			delete(want, dk)
 		}
 	}
+	waitFor(t, 10*time.Second, "leader log compaction", func() bool {
+		return c.servers[c.leaderID()].Node.Status().LogStart > 100
+	})
 	c.start(lagger)
 	// Writes during the transfer exercise the fuzzy-snapshot repair.
 	for i := 400; i < 460; i++ {

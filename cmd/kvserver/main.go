@@ -19,6 +19,7 @@ import (
 
 	"kvstore/engine"
 	"kvstore/kvnet"
+	"kvstore/raft"
 	"kvstore/replica"
 )
 
@@ -65,6 +66,7 @@ func main() {
 	s, err := replica.StartServer(replica.NodeConfig{
 		ID: *id, Dir: *dir, Peers: ps,
 		Engine: engine.Options{NoSync: *noSync},
+		Tune:   func(rc *raft.Config) { rc.NoSync = *noSync }, // -nosync also skips the Raft log fsync
 		Logf:   log.Printf,
 	})
 	if err != nil {

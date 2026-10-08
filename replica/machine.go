@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"kvstore/engine"
 	"kvstore/raft"
@@ -86,6 +87,8 @@ type KVMachine struct {
 	mu      sync.RWMutex // guards db (swapped by snapshot installs)
 	db      *engine.DB
 	staging *engine.DB
+
+	applied atomic.Uint64 // index of the last command applied (maybe not yet durable)
 }
 
 func OpenKVMachine(dir string, opts *engine.Options) (*KVMachine, error) {
@@ -93,6 +96,10 @@ func OpenKVMachine(dir string, opts *engine.Options) (*KVMachine, error) {
 	if opts != nil {
 		m.opts = *opts
 	}
+	// Durability of applied commands comes from the Raft log, which keeps them
+	// until Sync reports them durable; fsync-ing every apply would only add
+	// latency to the write path.
+	m.opts.NoSync = true
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -118,6 +125,12 @@ func OpenKVMachine(dir string, opts *engine.Options) (*KVMachine, error) {
 		return nil, err
 	}
 	m.db = db
+	idx, _, err := m.Applied()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	m.applied.Store(idx)
 	return m, nil
 }
 
@@ -163,7 +176,22 @@ func (m *KVMachine) Apply(index, term uint64, cmds [][]byte) error {
 	ops = append(ops, engine.Op{Key: appliedKey, Value: encodeApplied(index, term)})
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.db.Write(ops)
+	if err := m.db.Write(ops); err != nil {
+		return err
+	}
+	m.applied.Store(index)
+	return nil
+}
+
+// Sync fsyncs the engine and returns the index that is durable afterwards.
+func (m *KVMachine) Sync() (uint64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	idx := m.applied.Load() // read first: anything applied later is not covered
+	if err := m.db.Sync(); err != nil {
+		return 0, err
+	}
+	return idx, nil
 }
 
 // SnapshotScan pages through user data (the reserved marker is skipped).
@@ -270,6 +298,7 @@ func (m *KVMachine) RestoreFinish(index, term uint64) error {
 		return err
 	}
 	m.db = db
+	m.applied.Store(index)
 	return nil
 }
 

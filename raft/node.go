@@ -109,7 +109,8 @@ type Node struct {
 	log       *logStore
 	commit    uint64
 	applied   uint64 // applied in memory (includes trailing no-ops)
-	smApplied uint64 // last index handed to the state machine (durable)
+	smApplied uint64 // last index handed to the state machine
+	durable   uint64 // last index the state machine has made durable (log may be compacted up to here)
 	applying  bool
 	restoring *restoreSession
 
@@ -172,7 +173,7 @@ func NewNode(cfg Config) (*Node, error) {
 		n.log.close()
 		return nil, fmt.Errorf("raft: state machine (applied %d) is behind the log start (%d)", ai, n.log.prevIndex)
 	}
-	n.commit, n.applied, n.smApplied = ai, ai, ai
+	n.commit, n.applied, n.smApplied, n.durable = ai, ai, ai, ai
 
 	n.cond = sync.NewCond(&n.mu)
 	n.stopCh = make(chan struct{})
@@ -189,10 +190,11 @@ func NewNode(cfg Config) (*Node, error) {
 }
 
 func (n *Node) Start() {
-	n.wg.Add(3)
+	n.wg.Add(4)
 	go n.electionLoop()
 	go n.applyLoop()
 	go n.appendLoop()
+	go n.syncLoop()
 	for _, p := range n.others {
 		n.wg.Add(1)
 		go n.replicator(p)
@@ -225,12 +227,13 @@ type Status struct {
 	Commit    uint64
 	Applied   uint64
 	LastIndex uint64
+	LogStart  uint64 // entries up to here were compacted away
 }
 
 func (n *Node) Status() Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return Status{n.cfg.ID, n.role, n.term, n.leader, n.commit, n.applied, n.log.lastIndex()}
+	return Status{n.cfg.ID, n.role, n.term, n.leader, n.commit, n.applied, n.log.lastIndex(), n.log.prevIndex}
 }
 
 // ---- helpers (mu held unless noted) ----
@@ -612,7 +615,7 @@ func (n *Node) HandleInstallSnapshot(req *SnapReq) (*SnapResp, error) {
 		if s.snapIdx > n.commit {
 			n.commit = s.snapIdx
 		}
-		n.applied, n.smApplied = s.snapIdx, s.snapIdx
+		n.applied, n.smApplied, n.durable = s.snapIdx, s.snapIdx, s.snapIdx
 		n.restoring = nil
 		n.cfg.Logf("[%s] installed snapshot at %d", n.cfg.ID, s.snapIdx)
 		n.cond.Broadcast()
@@ -634,6 +637,7 @@ func (n *Node) advanceCommit() {
 	if c > n.commit {
 		if t, ok := n.log.term(c); ok && t == n.term { // only current-term entries commit by counting
 			n.commit = c
+			n.notifyCommitted()
 			n.cond.Broadcast()
 		}
 	}
@@ -947,15 +951,18 @@ func (n *Node) applyLoop() {
 		if len(cmds) > 0 {
 			n.smApplied = hi
 		}
-		n.notifyApplied()
 		n.maybeCompact()
 		n.cond.Broadcast()
 	}
 }
 
-func (n *Node) notifyApplied() {
+// notifyCommitted completes proposals whose entries are now committed. The
+// caller is acknowledged at commit, not at apply: the entry is durable on a
+// majority and can no longer be lost. Reads wait for the apply in ReadBarrier,
+// so they still observe it.
+func (n *Node) notifyCommitted() {
 	for idx, p := range n.waiters {
-		if idx > n.applied {
+		if idx > n.commit {
 			continue
 		}
 		if t, ok := n.log.term(idx); ok && t == p.term {
@@ -968,7 +975,7 @@ func (n *Node) notifyApplied() {
 }
 
 func (n *Node) maybeCompact() {
-	target := n.smApplied
+	target := n.durable
 	if target <= uint64(n.cfg.LogRetain) {
 		return
 	}
@@ -982,6 +989,38 @@ func (n *Node) maybeCompact() {
 		if err := n.log.compactTo(target); err != nil {
 			n.fatal(err)
 		}
+	}
+}
+
+// syncLoop periodically makes the state machine durable so the log can be
+// compacted up to what is safely on disk.
+func (n *Node) syncLoop() {
+	defer n.wg.Done()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-tick.C:
+		}
+		n.mu.Lock()
+		need := n.failed == nil && n.restoring == nil && n.smApplied > n.durable
+		n.mu.Unlock()
+		if !need {
+			continue
+		}
+		idx, err := n.cfg.SM.Sync()
+		n.mu.Lock()
+		if err != nil {
+			if !n.stopped {
+				n.fatal(fmt.Errorf("raft: state machine sync: %w", err))
+			}
+		} else if idx > n.durable && n.restoring == nil && idx <= n.smApplied {
+			n.durable = idx
+			n.maybeCompact()
+		}
+		n.mu.Unlock()
 	}
 }
 

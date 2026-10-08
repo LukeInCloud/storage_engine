@@ -86,6 +86,11 @@ type StateMachine interface {
 	// Apply atomically and durably applies cmds (in order) and records
 	// (index, term) as applied. cmds may be empty.
 	Apply(index, term uint64, cmds [][]byte) error
+	// Sync makes all applied commands durable and returns the highest index
+	// that is covered. Apply itself may be lazy about durability: the Raft log
+	// keeps every command that is not yet durably applied, so a crash replays
+	// them. The node calls Sync in the background.
+	Sync() (index uint64, err error)
 
 	// SnapshotScan streams the state: pass nil first, then next, until done.
 	SnapshotScan(cursor []byte, maxBytes int) (items []KV, next []byte, done bool, err error)

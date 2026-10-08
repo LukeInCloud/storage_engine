@@ -215,6 +215,12 @@ func TestFollowerCatchesUpViaSnapshot(t *testing.T) {
 			}
 		}
 	}
+	// Wait until the leader has really compacted its log past the lagger, so
+	// that only a snapshot can bring it back.
+	lagLast := c.nodes[lagger].Status().LastIndex
+	eventually(t, 5*time.Second, "leader log compaction", func() bool {
+		return c.leader().Status().LogStart > lagLast
+	})
 	// A write racing with the transfer exercises the fuzzy-snapshot repair.
 	c.net.heal(lagger)
 	for i := 200; i < 260; i++ {
@@ -310,4 +316,38 @@ func TestPartitionedNodeDoesNotDisruptLeader(t *testing.T) {
 	if cur := c.waitLeader(); cur.Status().ID != ld.Status().ID || cur.Status().Term != term {
 		t.Fatalf("leader disrupted: %s term %d -> %s term %d", ld.Status().ID, term, cur.Status().ID, cur.Status().Term)
 	}
+}
+
+// The log may only be compacted up to what the state machine reports durable:
+// after a crash the state machine can be that far behind, and the log is the
+// only place the missing commands still exist.
+func TestLogNeverCompactedPastDurableIndex(t *testing.T) {
+	c := newCluster(t, 3, 5)
+	c.waitLeader()
+	for i := 0; i < 40; i++ {
+		c.propose(fmt.Sprintf("a%d=1", i))
+	}
+	c.waitApplied(c.ids, "a39", "1")
+	eventually(t, 5*time.Second, "initial compaction", func() bool { return c.leader().Status().LogStart > 20 })
+
+	const limit = 60
+	for _, sm := range c.sms {
+		sm.setSyncLimit(limit)
+	}
+	for i := 0; i < 200; i++ {
+		c.propose(fmt.Sprintf("b%d=1", i))
+	}
+	c.waitApplied(c.ids, "b199", "1")
+	time.Sleep(300 * time.Millisecond) // several sync ticks
+	for id, n := range c.nodes {
+		if st := n.Status(); st.LogStart > limit {
+			t.Fatalf("%s compacted its log to %d although only %d is durable", id, st.LogStart, limit)
+		}
+	}
+	for _, sm := range c.sms {
+		sm.setSyncLimit(0)
+	}
+	eventually(t, 5*time.Second, "compaction to resume", func() bool {
+		return c.leader().Status().LogStart > 150
+	})
 }

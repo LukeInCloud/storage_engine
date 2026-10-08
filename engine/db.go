@@ -596,6 +596,29 @@ func (db *DB) scan(start, end []byte, maxBytes int) ([]KV, bool, error) {
 	return out, false, m.Err()
 }
 
+// Sync makes everything written so far durable. It is only needed with
+// Options.NoSync, where the caller batches durability itself (as the
+// replicated state machine does: its durability comes from the Raft log).
+func (db *DB) Sync() error {
+	db.mu.RLock()
+	closed := db.closed
+	w, iw := db.wal, db.immWAL
+	db.mu.RUnlock()
+	if closed {
+		return ErrClosed
+	}
+	for _, x := range []*wal{iw, w} { // the frozen WAL first: it holds the older data
+		if x == nil {
+			continue
+		}
+		// A WAL closed meanwhile was flushed into an SSTable, which is already durable.
+		if err := x.f.Sync(); err != nil && !errors.Is(err, os.ErrClosed) {
+			return err
+		}
+	}
+	return nil
+}
+
 // Flush writes the memtable to an SSTable and returns when it is durable in
 // the table layout (the WAL alone already guarantees durability; this is for
 // maintenance such as CompactAll).

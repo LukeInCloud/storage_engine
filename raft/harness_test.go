@@ -75,6 +75,8 @@ type memSM struct {
 	term    uint64
 	history []string // every applied command, in order
 	staging map[string]string
+	// syncLimit > 0 caps what Sync reports as durable (simulates a slow disk).
+	syncLimit uint64
 }
 
 func newMemSM() *memSM { return &memSM{data: map[string]string{}} }
@@ -100,6 +102,17 @@ func (s *memSM) Apply(index, term uint64, cmds [][]byte) error {
 	s.index, s.term = index, term
 	return nil
 }
+
+func (s *memSM) Sync() (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.syncLimit > 0 && s.index > s.syncLimit {
+		return s.syncLimit, nil
+	}
+	return s.index, nil
+}
+
+func (s *memSM) setSyncLimit(n uint64) { s.mu.Lock(); s.syncLimit = n; s.mu.Unlock() }
 
 func (s *memSM) SnapshotScan(cursor []byte, maxBytes int) ([]KV, []byte, bool, error) {
 	s.mu.Lock()
