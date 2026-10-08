@@ -430,6 +430,9 @@ func (n *Node) kickAll() {
 func (n *Node) HandleRequestVote(req *VoteReq) (*VoteResp, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.stopped {
+		return nil, ErrStopped
+	}
 	if n.failed != nil {
 		return nil, n.failed
 	}
@@ -464,6 +467,9 @@ func (n *Node) HandleRequestVote(req *VoteReq) (*VoteResp, error) {
 func (n *Node) HandleAppendEntries(req *AppendReq) (*AppendResp, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.stopped {
+		return nil, ErrStopped
+	}
 	if n.failed != nil {
 		return nil, n.failed
 	}
@@ -546,6 +552,9 @@ func (n *Node) abortRestore() {
 func (n *Node) HandleInstallSnapshot(req *SnapReq) (*SnapResp, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.stopped {
+		return nil, ErrStopped
+	}
 	if n.failed != nil {
 		return nil, n.failed
 	}

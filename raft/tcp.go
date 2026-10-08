@@ -118,6 +118,10 @@ func (t *TCPTransport) Close() {
 type RPCServer struct {
 	ln net.Listener
 	wg sync.WaitGroup
+
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
 }
 
 type rpcService struct{ n *Node }
@@ -155,7 +159,7 @@ func ServeRPC(ln net.Listener, n *Node) (*RPCServer, error) {
 	if err := srv.RegisterName("Raft", &rpcService{n}); err != nil {
 		return nil, err
 	}
-	s := &RPCServer{ln: ln}
+	s := &RPCServer{ln: ln, conns: map[net.Conn]struct{}{}}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -167,7 +171,20 @@ func ServeRPC(ln net.Listener, n *Node) (*RPCServer, error) {
 			if tc, ok := conn.(*net.TCPConn); ok {
 				tc.SetNoDelay(true)
 			}
-			go srv.ServeConn(conn)
+			s.mu.Lock()
+			if s.closed {
+				s.mu.Unlock()
+				conn.Close()
+				return
+			}
+			s.conns[conn] = struct{}{}
+			s.mu.Unlock()
+			go func() {
+				srv.ServeConn(conn) // returns when the connection closes
+				s.mu.Lock()
+				delete(s.conns, conn)
+				s.mu.Unlock()
+			}()
 		}
 	}()
 	return s, nil
@@ -175,7 +192,14 @@ func ServeRPC(ln net.Listener, n *Node) (*RPCServer, error) {
 
 func (s *RPCServer) Addr() string { return s.ln.Addr().String() }
 
+// Close stops accepting and drops all peer connections.
 func (s *RPCServer) Close() {
+	s.mu.Lock()
+	s.closed = true
 	s.ln.Close()
+	for c := range s.conns {
+		c.Close()
+	}
+	s.mu.Unlock()
 	s.wg.Wait()
 }
