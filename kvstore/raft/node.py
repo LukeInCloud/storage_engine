@@ -253,6 +253,11 @@ class Node:
         """Make mem the configuration in effect. mu held."""
         self.mem, self.config_index, self.voters = mem, index, mem.voters
         self.others = sorted(p for p in mem.members if p != self.cfg.id)
+        for p in [p for p in self.kick if p not in mem.members]:
+            # Removed: its replicator thread notices and exits.
+            self.kick.pop(p).set()
+            for d in (self.next, self.match, self.ack_time, self.snap_pin):
+                d.pop(p, None)
         for p in self.others:
             if p not in self.kick:
                 self.kick[p] = threading.Event()
@@ -656,7 +661,7 @@ class Node:
         while not self.stop_ev.is_set():
             ev.wait(self.cfg.heartbeat_interval)
             ev.clear()
-            if self.stop_ev.is_set():
+            if self.stop_ev.is_set() or self.kick.get(peer) is not ev:  # stopped or removed
                 return
             while self._replicate_once(peer):
                 pass
@@ -688,7 +693,7 @@ class Node:
             return False
 
         with self.mu:
-            if resp is None or self.role != LEADER or self.term != term:
+            if resp is None or self.role != LEADER or self.term != term or peer not in self.next:
                 return False
             if resp.term > self.term:
                 self._step_down(resp.term)
@@ -745,7 +750,8 @@ class Node:
                 except Exception:
                     return False
                 with self.mu:
-                    if resp is None or self.role != LEADER or self.term != term or self.stopped:
+                    if (resp is None or self.role != LEADER or self.term != term or self.stopped
+                            or peer not in self.next):
                         return False
                     if resp.term > self.term:
                         self._step_down(resp.term)
@@ -1004,6 +1010,25 @@ class Node:
             if nid in self.mem.members or not self._can_change_config():
                 return False
             self._append_config(self.mem.with_learner(nid, info))
+            return True
+
+    def remove_member(self, nid: str) -> bool:
+        """Leader only: drop nid (voter or learner) from the configuration.
+        Safe only if the caller established that nid is really gone, since
+        the quorum shrinks as soon as the entry is appended. Returns False if
+        nid is not a member or another change is in flight."""
+        with self.mu:
+            if self.stopped:
+                raise StoppedError()
+            if self.failed is not None:
+                raise self.failed
+            if self.role != LEADER:
+                raise self._not_leader()
+            if nid == self.cfg.id:
+                raise RaftError("raft: a leader cannot remove itself")
+            if nid not in self.mem.members or not self._can_change_config():
+                return False
+            self._append_config(self.mem.without(nid))
             return True
 
     def _promote_loop(self) -> None:

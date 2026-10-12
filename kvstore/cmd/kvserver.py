@@ -46,6 +46,9 @@ def main(argv=None) -> int:
     ap.add_argument("-raft", "--raft", default="", help="this node's raft RPC address (with -join)")
     ap.add_argument("-join", "--join", default="",
                     help="raft address of one existing member: join its cluster as a new node")
+    ap.add_argument("-dead-after", "--dead-after", default="60s",
+                    help="remove a cluster member that a majority of voters have not heard of "
+                         "for this long (0 = never)")
     ap.add_argument("-stats", "--stats", default="0",
                     help="log engine statistics at this interval (standalone mode), e.g. 5s")
     args = ap.parse_args(argv)
@@ -78,7 +81,7 @@ def main(argv=None) -> int:
     else:
         peers = parse_peers(args.peers)
     s = start_server(NodeConfig(
-        id=args.id, dir=args.dir, peers=peers, join=args.join,
+        id=args.id, dir=args.dir, peers=peers, join=args.join, dead_after=parse_duration(args.dead_after),
         engine=Options(no_sync=args.nosync),
         tune=lambda rc: setattr(rc, "no_sync", args.nosync),  # -nosync also skips the Raft log fsync
         logf=lambda f, *a: log.info(f % a if a else f)))

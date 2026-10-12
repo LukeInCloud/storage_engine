@@ -177,6 +177,19 @@ address of *one* member (`-join`). What happens:
    retained log is persisted in `raft/members` before the log is compacted
    past its entry, and travels in snapshots.
 
+**Removing dead nodes.** Gossip alone never removes anybody; the cluster
+agrees first. A member that has been silent (its gossip heartbeat has not
+advanced) for `dead_after` (`-dead-after`, default 60 s, 0 disables) is a
+candidate. The leader asks the other voters whether *they* also consider it
+silent (`DeadQuery` RPC) and proceeds only if a majority of the current
+voters, itself included, confirm. A leader cut off from the majority therefore
+can never shrink the cluster to a quorum of its own. It then appends a
+configuration entry without the node (one change at a time, like additions).
+Every node applies the entry: the node leaves its peer lists, replicator
+threads, address tables and gossip table (a tombstone makes gossip ignore it
+until it returns with a newer generation, i.e. after a restart, when it is
+treated as a new joiner). Removed learners and voters are handled alike.
+
 ### Differences from the Go version
 
 The Python port keeps the algorithms and file layouts, and changes what the
@@ -217,7 +230,9 @@ python3 -m unittest tests.test_raft -v                  # one suite
   and persisted across restarts, one change at a time, only the leader changes;
   real TCP nodes joining through one peer (also chained: each new node knows
   only the previous one), copying data, becoming voters, surviving a leader kill and a
-  restart without any join flag, and a seed that is down when the node starts.
+  restart without any join flag, and a seed that is down when the node starts;
+  removal of a dead node (only with majority confirmation, not after a short
+  outage or while the quorum is lost), persisted across restarts and compaction.
 * Raft: elections, replication, identical apply order on all nodes, failover,
   partitions (uncommitted writes of a deposed leader vanish), catch-up from the
   log and by snapshot, restarts, ReadIndex, pre-vote, log never compacted past
@@ -275,10 +290,12 @@ way to push high item rates, since per-request overhead dominates.
 
 ## Limitations (what a production system would still need)
 
-* **Membership can only grow**: nodes can be added (gossip + learners +
-  single-server changes) but not removed, and a node's addresses cannot
-  change. Gossip never removes anybody, so a permanently dead node still
-  counts for quorums. No joint consensus (not needed for one-at-a-time changes).
+* **Removal is automatic only for dead nodes**: there is no operator command
+  to remove a healthy node, and a node's addresses cannot change. A partitioned
+  node that was removed and then reconnects with the same process is ignored
+  until it restarts. Removing a node when the cluster is already without
+  quorum is impossible (it needs a commit). No joint consensus (not needed for
+  one-at-a-time changes).
 * **Joining is unauthenticated**: any process that can reach a member's Raft
   port and gossips a table entry is added to the cluster, and can pull a copy
   of the data.

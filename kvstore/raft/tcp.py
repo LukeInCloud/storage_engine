@@ -18,6 +18,7 @@ M_APPEND_ENTRIES = 2
 M_INSTALL_SNAPSHOT = 3
 M_GOSSIP = 4  # opaque to Raft: handed to the gossip handler of the RPC server
 M_PULL_SNAPSHOT = 5
+M_DEAD_QUERY = 6  # opaque to Raft: "do you consider node X dead?", answered by a handler
 
 MAX_RPC_FRAME = 256 << 20
 MAX_IDLE_PER_PEER = 4
@@ -304,6 +305,10 @@ class TCPTransport(Transport):
     def gossip(self, addr: str, body: bytes, timeout: float) -> bytes:
         return self.call_addr(addr, M_GOSSIP, timeout, body)
 
+    def ask_dead(self, to: str, nid: str) -> bool:
+        """Ask peer `to` whether it considers node nid dead."""
+        return self._call(to, M_DEAD_QUERY, self.timeout, nid.encode()) == b"\x01"
+
     def pull_snapshot(self, addr: str, req: PullReq) -> PullResp:
         return dec_pull_resp(self.call_addr(addr, M_PULL_SNAPSHOT, max(self.timeout, 10.0),
                                             enc_pull_req(req)))
@@ -324,9 +329,10 @@ class RPCServer(FrameServer):
     """Serves a Node's handlers to its peers. gossip, if given, is a callable
     bytes -> bytes that answers M_GOSSIP requests."""
 
-    def __init__(self, addr: str, node, gossip=None):
+    def __init__(self, addr: str, node, gossip=None, dead_query=None):
         self.node = node
         self.gossip = gossip
+        self.dead_query = dead_query  # callable(node id: str) -> bool
         super().__init__(addr, self._handle, MAX_RPC_FRAME, name="raft-rpc")
 
     def _handle(self, req: bytes) -> bytes:
@@ -342,6 +348,8 @@ class RPCServer(FrameServer):
                 out = enc_snap_resp(self.node.handle_install_snapshot(dec_snap_req(body)))
             elif method == M_PULL_SNAPSHOT:
                 out = enc_pull_resp(self.node.handle_pull_snapshot(dec_pull_req(body)))
+            elif method == M_DEAD_QUERY and self.dead_query is not None:
+                out = b"\x01" if self.dead_query(bytes(body).decode()) else b"\x00"
             elif method == M_GOSSIP and self.gossip is not None:
                 out = self.gossip(bytes(body))
             else:
@@ -351,6 +359,6 @@ class RPCServer(FrameServer):
             return b"\x01" + (str(e) or type(e).__name__).encode()
 
 
-def serve_rpc(addr: str, node, gossip=None) -> RPCServer:
+def serve_rpc(addr: str, node, gossip=None, dead_query=None) -> RPCServer:
     """Accept peer connections on addr until close()."""
-    return RPCServer(addr, node, gossip)
+    return RPCServer(addr, node, gossip, dead_query)

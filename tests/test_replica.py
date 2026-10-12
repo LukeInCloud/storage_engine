@@ -103,8 +103,9 @@ def free_addr() -> str:
 class TCluster:
     """A real cluster: TCP, real engine, one directory per node."""
 
-    def __init__(self, tc: TempDirTestCase, size: int, tune=None):
+    def __init__(self, tc: TempDirTestCase, size: int, tune=None, node_kw=None):
         self.tc = tc
+        self.node_kw = node_kw or {}
         self.tune = tune
         self.peers = [Peer("n%d" % i, free_addr(), free_addr()) for i in range(1, size + 1)]
         self.dirs = {p.id: tc.tmpdir() for p in self.peers}
@@ -134,7 +135,7 @@ class TCluster:
 
         self.servers[nid] = start_server(NodeConfig(
             id=nid, dir=self.dirs[nid], peers=self.peers,
-            engine=Options(no_sync=True), tune=tune, logf=logf))
+            engine=Options(no_sync=True), tune=tune, logf=logf, **self.node_kw))
 
     def stop(self, nid):
         self.servers.pop(nid).close()

@@ -20,8 +20,11 @@ newcomer's entry into that member's table, from where gossip carries it to
 everybody. Until the first exchange succeeds, every round retries the seeds.
 
 Liveness: an entry whose version has not advanced for `fail_after` seconds
-(locally measured) is reported as not alive. Gossip alone never removes a
-member.
+(locally measured) is reported as not alive; silent_for() gives the exact
+time. Gossip itself never removes a member: the cluster does that by
+agreement (see replica.server) and then calls forget(), which drops the entry
+and ignores it until the node shows up with a newer generation, i.e. after a
+restart.
 
 The wire format is   count | (id raft_addr client_addr generation heartbeat)*
 with varints and length-prefixed strings; the transport is injected:
@@ -109,6 +112,7 @@ class Gossip:
         self._mu = threading.Lock()
         self._table: Dict[str, Member] = {}
         self._seen: Dict[str, float] = {}  # id -> local monotonic time of its last version advance
+        self._gone: Dict[str, int] = {}  # forgotten id -> generation it had; older/equal is ignored
         self.me = me
         me.generation = me.generation or int(time.time() * 1000)
         self._table[me.id] = me
@@ -127,6 +131,10 @@ class Gossip:
         with self._mu:
             for m in incoming:
                 cur = self._table.get(m.id)
+                if m.id in self._gone:
+                    if m.generation <= self._gone[m.id]:
+                        continue
+                    del self._gone[m.id]  # it restarted: a new incarnation
                 if m.id == self.me.id:
                     # Someone has a newer version of us (an earlier incarnation
                     # with a later clock): outrank it.
@@ -162,10 +170,31 @@ class Gossip:
         if nid == self.me.id:
             return
         with self._mu:
+            self._gone.pop(nid, None)  # the configuration says it is a member
             if nid in self._table:
                 return
             self._table[nid] = Member(nid, raft_addr, client_addr)
             self._seen[nid] = time.monotonic()
+
+    def forget(self, nid: str) -> None:
+        """The node was removed from the cluster: drop it and ignore gossip
+        about it until it comes back with a newer generation."""
+        if nid == self.me.id:
+            return
+        with self._mu:
+            cur = self._table.pop(nid, None)
+            self._seen.pop(nid, None)
+            self._gone[nid] = cur.generation if cur is not None else self._gone.get(nid, 0)
+
+    def silent_for(self, nid: str) -> float:
+        """Seconds since the entry of nid last advanced (0 for this node,
+        inf for a node that is not in the table)."""
+        with self._mu:
+            if nid == self.me.id:
+                return 0.0
+            if nid not in self._seen:
+                return float("inf")
+            return time.monotonic() - self._seen[nid]
 
     def members(self) -> List[Member]:
         """A copy of the table, sorted by id."""

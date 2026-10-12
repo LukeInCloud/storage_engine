@@ -54,6 +54,10 @@ class NodeConfig:
     join: str = ""
     join_timeout: float = 10.0  # how long start_server waits for the first contact
     gossip_interval: float = 0.5
+    # A member silent (no gossip heartbeat) for this long is a candidate for
+    # removal: the leader drops it once a majority of voters agree it is
+    # silent for them too. 0 disables automatic removal.
+    dead_after: float = 60.0
 
 
 class Server:
@@ -69,16 +73,58 @@ class Server:
         self.gossip = None
         self._stop = threading.Event()
         self._reconciler = None
+        self.dead_after = 0.0
 
     def members(self):
         """What this node's gossip knows: a list of gossip.Member (with .alive)."""
         return self.gossip.members()
 
+    def is_dead(self, nid: str) -> bool:
+        """This node's own opinion: nid has been silent for dead_after."""
+        return self.dead_after > 0 and self.gossip.silent_for(nid) >= self.dead_after
+
+    def _remove_dead(self) -> None:
+        """Leader: remove a member that a majority of voters, itself
+        included, have not heard of for dead_after. Done one at a time; the
+        configuration entry then makes every node drop it from its peers."""
+        mem = self.node.membership()
+        for nid in sorted(mem.members):
+            if nid == self.node.cfg.id or not self.is_dead(nid):
+                continue
+            voters = [v for v in mem.voters if v != nid]
+            need = len(mem.voters) // 2 + 1
+            agree = 1 if self.node.cfg.id in mem.voters else 0
+            for v in voters:
+                if v == self.node.cfg.id or agree >= need:
+                    continue
+                try:
+                    if self.transport.ask_dead(v, nid):
+                        agree += 1
+                except Exception:
+                    pass  # unreachable voters do not confirm
+            if agree < need:
+                continue  # a minority of the cluster must never shrink it
+            _log.warning("removing dead member %s (confirmed by %d of %d voters)", nid, agree,
+                         len(mem.voters))
+            try:
+                self.node.remove_member(nid)
+            except NotLeaderError:
+                pass
+            return
+
     def _reconcile_loop(self) -> None:
-        """The leader turns members learned by gossip into Raft members."""
+        """The leader turns members learned by gossip into Raft members and
+        drops members that are confirmed dead."""
+        last_check = 0.0
         while not self._stop.wait(0.1):
             if self.node.status().role != LEADER:
                 continue
+            if self.dead_after > 0 and time.monotonic() - last_check >= 1.0:
+                last_check = time.monotonic()
+                try:
+                    self._remove_dead()
+                except Exception as e:
+                    _log.warning("remove dead members: %s", e)
             known = self.node.membership().members
             for m in self.gossip.members():
                 if m.id in known or not m.alive or not m.raft_addr:
@@ -134,12 +180,20 @@ def start_server(cfg: NodeConfig) -> Server:
         raise ValueError("replica: node %r is not in the peer list" % cfg.id)
 
     s = Server()
+    s.dead_after = cfg.dead_after
     client_addrs = {}
+    known = set()  # members seen in the latest configurations
     addrs_mu = threading.Lock()
 
     def on_config(mem) -> None:
         # Runs inside the Raft node: only touch things that never call back.
         with addrs_mu:
+            for nid in [n for n in known if n not in mem.members]:
+                known.discard(nid)  # removed from the cluster
+                client_addrs.pop(nid, None)
+                if s.gossip is not None:
+                    s.gossip.forget(nid)
+            known.update(mem.members)
             for nid, info in mem.members.items():
                 r, c = split_info(info)
                 if nid != cfg.id and r:
@@ -171,7 +225,7 @@ def start_server(cfg: NodeConfig) -> Server:
         me = Member(cfg.id, self_peer.raft_addr, self_peer.client_addr)
         s.gossip = Gossip(me, tr.gossip, seeds=[cfg.join] if cfg.join else [],
                           interval=cfg.gossip_interval)
-        s.rpc = serve_rpc(self_peer.raft_addr, node, s.gossip.handle)
+        s.rpc = serve_rpc(self_peer.raft_addr, node, s.gossip.handle, s.is_dead)
         if cfg.join:
             _join_cluster(cfg, s)
         s.store = Store(node, sm, 0)

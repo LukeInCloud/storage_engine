@@ -46,6 +46,10 @@ class Membership:
         m[nid] = info
         return Membership(m, self.voters)
 
+    def without(self, nid: str) -> "Membership":
+        m = {k: v for k, v in self.members.items() if k != nid}
+        return Membership(m, self.voters - {nid})
+
     def with_voter(self, nid: str) -> "Membership":
         if nid not in self.members:
             raise KeyError(nid)

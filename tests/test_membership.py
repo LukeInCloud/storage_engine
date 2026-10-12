@@ -250,6 +250,43 @@ class TestRaftMembership(ClusterTestCase):
         eventually(10, "five voters", lambda: self.voters_everywhere(want, want))
 
 
+class TestRaftRemoval(ClusterTestCase):
+    def test_remove_dead_member(self):
+        self.new_cluster(3, retain=1000)
+        ld = self.wait_leader()
+        self.propose("a=1")
+        self.crash("n3")
+        eventually(5, "removed", lambda: self.wait_leader().remove_member("n3"))
+        live = ["n1", "n2"]
+        eventually(5, "n3 gone on every node",
+                   lambda: all(self.nodes[i].membership().members.keys() == {"n1", "n2"} for i in live))
+        self.assertEqual(self.nodes["n1"].membership().voters, frozenset(live))
+        self.assertFalse(self.wait_leader().remove_member("n3"), "already gone")
+        with self.assertRaises(Exception):
+            self.wait_leader().remove_member(self.wait_leader().cfg.id)
+        self.propose("b=2")
+        self.wait_applied(live, "b", "2")
+        # Persisted: a restart of a survivor keeps the smaller cluster.
+        self.crash("n2")
+        self.start_node("n2")
+        self.assertEqual(self.nodes["n2"].membership().voters, frozenset(live))
+        self.propose("c=3")
+        self.wait_applied(live, "c", "3")
+
+    def test_removal_survives_log_compaction_and_snapshot(self):
+        self.new_cluster(4, retain=5)
+        for i in range(30):
+            self.propose("k%d=%d" % (i, i))
+        self.crash("n4")
+        eventually(5, "removed", lambda: self.wait_leader().remove_member("n4"))
+        for i in range(60):
+            self.propose("m%d=%d" % (i, i))
+        eventually(8, "compaction", lambda: self.wait_leader().status().log_start > 40)
+        self.crash("n1")
+        self.start_node("n1")  # config from the persisted base + log
+        self.assertEqual(self.nodes["n1"].membership().voters, frozenset(["n1", "n2", "n3"]))
+
+
 class TestJoinCluster(TempDirTestCase):
     def join(self, c, nid, seed_id, **kw):
         seed = next(p for p in c.peers + list(getattr(c, "joined", {}).values()) if p.id == seed_id)
@@ -356,6 +393,43 @@ class TestJoinCluster(TempDirTestCase):
         # The seed comes back (same dir, same addresses): n2 finds it by itself.
         c.start("n1")
         wait_for(lambda: s.node.membership().voters == frozenset(["n1", "n2"]), 15, "n2 to be added")
+
+    def test_dead_node_is_removed_by_quorum(self):
+        kw = dict(gossip_interval=0.1, dead_after=1.5)
+        c = TCluster(self, 3, node_kw=kw)
+        c.wait_leader()
+        cl = c.client()
+        cl.put(b"k", b"1")
+        dead = next(i for i in ("n3", "n2", "n1") if i != c.leader_id())
+        c.stop(dead)
+        left = [p.id for p in c.peers if p.id != dead]
+        wait_for(lambda: all(c.servers[i].node.membership().members.keys() == set(left) for i in left),
+                 20, "dead node removed from every peer list")
+        for i in left:
+            self.assertEqual({m.id for m in c.servers[i].members()}, set(left))
+            self.assertEqual(c.servers[i].node.membership().voters, frozenset(left))
+        cl.put(b"k2", b"2")
+        c.wait_converged({"k": "1", "k2": "2"}, left)
+
+    def test_short_outage_and_lost_quorum_do_not_remove(self):
+        kw = dict(gossip_interval=0.1, dead_after=1.5)
+        c = TCluster(self, 3, node_kw=kw)
+        c.wait_leader()
+        c.client().put(b"k", b"1")
+        # A brief outage (shorter than dead_after) is not death.
+        victim = next(i for i in ("n3", "n2", "n1") if i != c.leader_id())
+        c.stop(victim)
+        time.sleep(0.5)
+        c.start(victim)
+        time.sleep(2.5)
+        for s in c.servers.values():
+            self.assertEqual(len(s.node.membership().members), 3)
+        # Two of three down: the survivor cannot get a majority to confirm.
+        ld = c.leader_id()
+        for i in [p.id for p in c.peers if p.id != ld]:
+            c.stop(i)
+        time.sleep(4)
+        self.assertEqual(len(c.servers[ld].node.membership().members), 3)
 
 
 if __name__ == "__main__":
