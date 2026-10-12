@@ -66,6 +66,7 @@ python3 -m kvstore.cmd.kvcli -addr 127.0.0.1:7000 del a
 P=n1=127.0.0.1:9001/127.0.0.1:7001,n2=127.0.0.1:9002/127.0.0.1:7002,n3=127.0.0.1:9003/127.0.0.1:7003
 for i in 1 2 3; do python3 -m kvstore.cmd.kvserver -id n$i -dir data$i -peers $P & done
 python3 -m kvstore.cmd.kvcli -addr 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put k v   # follows the leader
+python3 -m kvstore.cmd.kvcli -addr 127.0.0.1:7002 get k   # any one node is enough: a follower redirects to the leader
 
 # add a 4th node: it is told about ONE existing member (any of them) and nothing else
 python3 -m kvstore.cmd.kvserver -id n4 -dir data4 -addr 127.0.0.1:7004 -raft 127.0.0.1:9004 \

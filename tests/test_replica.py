@@ -203,6 +203,26 @@ class TestCluster(TempDirTestCase):
         with self.assertRaises(Exception):
             cl.put(b"", b"x")
 
+    def test_cli_follows_leader_from_any_single_address(self):
+        import contextlib
+        import io
+        from kvstore.cmd import kvcli
+
+        c = TCluster(self, 3)
+        lid = c.wait_leader()
+        follower = next(p for p in c.peers if p.id != lid)
+
+        def run(*cmd):
+            raw = io.BytesIO()
+            out = io.TextIOWrapper(raw, write_through=True)  # the CLI writes to .buffer
+            with contextlib.redirect_stdout(out):
+                rc = kvcli.main(["-addr", follower.client_addr, *cmd])
+            return rc, raw.getvalue().decode()
+
+        self.assertEqual(run("put", "city", "Warsaw")[0], 0)  # a follower's address
+        self.assertEqual(run("get", "city"), (0, "Warsaw\n"))
+        self.assertEqual(run("get", "nope")[0], 1)
+
     def test_leader_failover_and_rejoin(self):
         c = TCluster(self, 3)
         c.wait_leader()

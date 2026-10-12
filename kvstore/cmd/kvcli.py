@@ -13,7 +13,8 @@ from .. import kvnet
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="kvcli", description="tiny kvstore client")
     ap.add_argument("-addr", "--addr", default="127.0.0.1:7000",
-                    help="server address, or comma-separated list for a cluster")
+                    help="address of any one node (a follower redirects to the leader), "
+                         "or a comma-separated list for failover when nodes may be down")
     ap.add_argument("command", nargs="*")
     args = ap.parse_args(argv)
     a = args.command
@@ -25,10 +26,15 @@ def main(argv=None) -> int:
         return s.encode() if s else None
 
     try:
-        if "," in args.addr:
-            c = kvnet.dial_cluster(args.addr.split(","), 10.0, 15.0)
+        addrs = [x.strip() for x in args.addr.split(",") if x.strip()]
+        if len(addrs) > 1:
+            c = kvnet.dial_cluster(addrs, 10.0, 15.0)
         else:
-            c = kvnet.dial(args.addr, 10.0)
+            # One address is enough for a cluster too: if it is a follower, the
+            # client is redirected to the leader (and retries across failovers).
+            # Connect eagerly so that a wrong address still fails at once.
+            c = kvnet.dial(addrs[0], 10.0)
+            c.retry_for = 15.0
     except OSError as e:
         print("error:", e, file=sys.stderr)
         return 1
