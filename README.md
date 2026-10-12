@@ -29,7 +29,9 @@ same on-disk and wire concepts, same test strategy.
 kvstore/engine/    LSM storage engine: WAL, memtable, SSTables, manifest,
                    leveled compaction, block cache, group commit, throttle, stats
 kvstore/kvnet/     TCP protocol, server (any store), client (single node or cluster-aware)
-kvstore/raft/      Raft consensus: durable log, elections, replication, snapshots, ReadIndex
+kvstore/raft/      Raft consensus: durable log, elections, replication, snapshots, ReadIndex,
+                   membership changes (learners, single-server additions)
+kvstore/gossip/    Gossip membership/liveness protocol used to discover and introduce nodes
 kvstore/replica/   Glue: Raft state machine over the engine, replicated Store, start_server
 kvstore/cmd/       kvserver, kvcli, kvbench (load generator)
 tests/             unittest suites for every layer
@@ -64,6 +66,12 @@ python3 -m kvstore.cmd.kvcli -addr 127.0.0.1:7000 del a
 P=n1=127.0.0.1:9001/127.0.0.1:7001,n2=127.0.0.1:9002/127.0.0.1:7002,n3=127.0.0.1:9003/127.0.0.1:7003
 for i in 1 2 3; do python3 -m kvstore.cmd.kvserver -id n$i -dir data$i -peers $P & done
 python3 -m kvstore.cmd.kvcli -addr 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 put k v   # follows the leader
+
+# add a 4th node: it is told about ONE existing member (any of them) and nothing else
+python3 -m kvstore.cmd.kvserver -id n4 -dir data4 -addr 127.0.0.1:7004 -raft 127.0.0.1:9004 \
+        -join 127.0.0.1:9002 &
+# -id/-addr/-raft without -peers and -join starts a one-node cluster; restarts need none of
+# these flags beyond -id/-addr/-raft (the membership is persisted in the node's directory)
 ```
 
 Useful server flags: `-nosync` (unsafe: no fsync), `-stats 10s` (engine counters).
@@ -136,6 +144,39 @@ commands, anchored at an index; replaying the retained log after that index
 repairs the fuzziness (puts and deletes are idempotent). The follower builds the
 new state in a side database and swaps it in with a crash-safe commit point.
 
+**Adding nodes (gossip + Raft).** A new node is configured with the Raft
+address of *one* member (`-join`). What happens:
+
+1. *Introduction (gossip).* The node exchanges member tables with that peer
+   (push-pull: it sends its own entry, it receives the peer's whole table).
+   Now it knows every member's id and addresses, and the peer's table contains
+   the newcomer. Every `gossip_interval` each node bumps a heartbeat and
+   exchanges tables with `fanout` random peers; entries only move to higher
+   versions `(generation, heartbeat)`, so tables converge, and a node that
+   learns something new gossips immediately instead of waiting for its tick,
+   so the news reaches N nodes in O(log N) rounds. Entries not advanced for
+   `fail_after` are shown as not alive.
+2. *Initial data.* Before it takes part in anything, the node pulls a copy of
+   the state from the seed (`PullSnapshot`, chunked). The copy is a fuzzy
+   snapshot anchored at an index of the seed's log, with the configuration in
+   effect at that index; the rest is repaired by normal replication, exactly
+   like a snapshot sent by a leader. If the seed cannot serve it, the leader
+   sends a snapshot instead.
+3. *Raft membership.* Each leader periodically compares the gossip table with
+   the Raft configuration and adds unknown, live nodes with a configuration
+   log entry (**single-server change**: one change at a time, only after an
+   entry of the leader's own term has committed). The node is first a
+   *learner*: it is replicated to but is not counted for quorums and never
+   campaigns, so a node that is still copying data cannot stall commits or
+   disturb elections. When it is within one batch of the leader's log and
+   answering, the leader promotes it to voter with a second entry.
+4. A configuration takes effect when it is *appended* (not committed); a
+   follower that has a conflicting suffix truncated reverts to the previous
+   one. Entries carry the members' addresses, so every node learns them from
+   the log even if gossip is late. The configuration at the start of the
+   retained log is persisted in `raft/members` before the log is compacted
+   past its entry, and travels in snapshots.
+
 ### Differences from the Go version
 
 The Python port keeps the algorithms and file layouts, and changes what the
@@ -170,6 +211,13 @@ python3 -m unittest tests.test_raft -v                  # one suite
   starvation, and **`TestKill9Loop`**: a writer process is `SIGKILL`ed 12 times
   at random moments (inside WAL appends, flushes and compactions) and every
   acknowledged operation must survive.
+* Membership: gossip convergence from a single seed, a late joiner known to
+  everybody, liveness and restarts (generation), address changes; Raft learner
+  promotion, a new voter completing quorums, configuration carried by snapshots
+  and persisted across restarts, one change at a time, only the leader changes;
+  real TCP nodes joining through one peer (also chained: each new node knows
+  only the previous one), copying data, becoming voters, surviving a leader kill and a
+  restart without any join flag, and a seed that is down when the node starts.
 * Raft: elections, replication, identical apply order on all nodes, failover,
   partitions (uncommitted writes of a deposed leader vanish), catch-up from the
   log and by snapshot, restarts, ReadIndex, pre-vote, log never compacted past
@@ -227,7 +275,14 @@ way to push high item rates, since per-request overhead dominates.
 
 ## Limitations (what a production system would still need)
 
-* **Static membership**: the node set is fixed at start; no joint consensus.
+* **Membership can only grow**: nodes can be added (gossip + learners +
+  single-server changes) but not removed, and a node's addresses cannot
+  change. Gossip never removes anybody, so a permanently dead node still
+  counts for quorums. No joint consensus (not needed for one-at-a-time changes).
+* **Joining is unauthenticated**: any process that can reach a member's Raft
+  port and gossips a table entry is added to the cluster, and can pull a copy
+  of the data.
+* Gossip exchanges the whole table (fine for tens of nodes; use digests beyond).
 * One Raft group holds the whole key space (no sharding), so write throughput is
   that of one leader.
 * No TLS or authentication; no CheckQuorum, lease reads or follower reads.

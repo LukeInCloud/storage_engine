@@ -3,7 +3,7 @@ import struct
 import zlib
 
 from ..util import pread_exact, pwrite_all, sync_dir, write_all, write_file_atomic
-from .types import Entry
+from .types import KIND_CONFIG, KIND_NORMAL, Entry
 
 # ---- hard state: current_term and voted_for ----
 # Must be durable before answering any RPC that depends on it.
@@ -39,6 +39,7 @@ def load_hard_state(directory: str):
 # File: header | record*
 #   header: prev_index(u64) prev_term(u64) crc32(u32)   (entries start after prev_index)
 #   record: len(u32) crc32(u32) | term(u64) index(u64) data
+#           (the top bit of len marks a configuration entry; older logs never set it)
 #
 # Records are only appended; a conflicting suffix is removed by truncating the
 # file. Compaction drops a prefix in memory at once and rewrites the file
@@ -49,6 +50,7 @@ _HDR = struct.Struct("<QQ")
 _U32 = struct.Struct("<I")
 _REC = struct.Struct("<II")
 _TI = struct.Struct("<QQ")
+_CONFIG_FLAG = 0x80000000
 
 
 def log_path(directory: str) -> str:
@@ -62,7 +64,8 @@ def encode_header(prev_index: int, prev_term: int) -> bytes:
 
 def encode_record(e: Entry) -> bytes:
     payload = _TI.pack(e.term, e.index) + (e.data or b"")
-    return _REC.pack(len(payload), zlib.crc32(payload)) + payload
+    n = len(payload) | (_CONFIG_FLAG if e.kind == KIND_CONFIG else 0)
+    return _REC.pack(n, zlib.crc32(payload)) + payload
 
 
 class LogStore:
@@ -101,6 +104,8 @@ class LogStore:
         nxt = l.prev_index + 1
         while len(data) - pos >= 8:
             n, crc = _REC.unpack_from(data, pos)
+            kind = KIND_CONFIG if n & _CONFIG_FLAG else KIND_NORMAL
+            n &= ~_CONFIG_FLAG
             if n < 16 or len(data) - pos - 8 < n:
                 break
             payload = data[pos + 8:pos + 8 + n]
@@ -110,7 +115,7 @@ class LogStore:
             if index != nxt:
                 break
             body = bytes(payload[16:])
-            l.entries.append(Entry(term, index, body if body else None))
+            l.entries.append(Entry(term, index, body if body else None, kind))
             l.offs.append(pos)
             pos += 8 + n
             nxt += 1

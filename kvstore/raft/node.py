@@ -5,13 +5,14 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from ..util import WaitGroup
+from .membership import Membership, load_base, save_base
 from .storage import LogStore, load_hard_state, save_hard_state
-from .types import (AppendReq, AppendResp, Entry, KV, NotLeaderError, RaftTimeoutError, SnapReq,
-                    SnapResp, StateMachine, StoppedError, TooBigError, Transport, VoteReq,
-                    VoteResp)
+from .types import (KIND_CONFIG, KIND_NORMAL, AppendReq, AppendResp, Entry, KV, NotLeaderError,
+                    PullReq, PullResp, RaftError, RaftTimeoutError, SnapReq, SnapResp,
+                    StateMachine, StoppedError, TooBigError, Transport, VoteReq, VoteResp)
 
 _log = logging.getLogger("raft")
 
@@ -24,8 +25,16 @@ MAX_APPLY_BATCH = 1024
 @dataclass
 class Config:
     id: str = ""
-    peers: List[str] = None  # IDs of ALL nodes in the cluster, including this one
+    peers: List[str] = None  # IDs of ALL nodes in the cluster, including this one (initial bootstrap)
     dir: str = ""  # holds raft.log and state; created if missing
+
+    # Dynamic membership. A node that has a persisted configuration (it was
+    # added to a cluster earlier, or compacted its log) ignores peers.
+    join: bool = False  # start as a non-member: no elections until a leader adds this node
+    peer_info: Optional[Dict[str, str]] = None  # opaque per-node info (addresses) carried in configs
+    # Called (with the node mutex held: do not block or call back into the
+    # Node) whenever the configuration in effect changes, and once at start().
+    on_config: Optional[Callable[[Membership], None]] = None
 
     transport: Transport = None
     sm: StateMachine = None
@@ -114,12 +123,26 @@ class Node:
         cfg.set_defaults()
         if cfg.transport is None or cfg.sm is None or not cfg.id:
             raise ValueError("raft: id, transport and sm are required")
-        peers = cfg.peers or []
-        if cfg.id not in peers:
-            raise ValueError("raft: peers must include this node's id")
         self.cfg = cfg
-        self.others = [p for p in peers if p != cfg.id]
         os.makedirs(cfg.dir, exist_ok=True)
+        base = load_base(cfg.dir)
+        if base is None:
+            if cfg.join:
+                # Persist "member of nothing" at once: a restart without the
+                # join option must not turn this node into a cluster of one.
+                base = (0, Membership())
+                save_base(cfg.dir, 0, base[1])
+            else:
+                peers = cfg.peers or []
+                if cfg.id not in peers:
+                    raise ValueError("raft: peers must include this node's id")
+                info = cfg.peer_info or {}
+                base = (0, Membership({p: info.get(p, "") for p in peers}, peers))
+        # Configuration: base is in effect at log index base_index; hist lists
+        # the configuration entries in the log after it (the last one wins).
+        self.base_index, self.base = base
+        self.hist = []
+        self.started = False
 
         self.mu = threading.Lock()
         self.cond = threading.Condition(self.mu)  # notified on any state change waiters care about
@@ -149,6 +172,12 @@ class Node:
         except BaseException:
             self.log.close()
             raise
+        self.hist = [(e.index, Membership.decode(e.data)) for e in self.log.entries
+                     if e.kind == KIND_CONFIG and e.index > self.base_index]
+        self.mem, self.config_index = (self.hist[-1][1], self.hist[-1][0]) if self.hist else (
+            self.base, self.base_index)
+        self.voters = self.mem.voters
+        self.others = sorted(p for p in self.mem.members if p != cfg.id)
         self.commit = self.applied = self.sm_applied = self.durable = ai
         # applied: applied in memory (includes trailing no-ops)
         # sm_applied: last index handed to the state machine
@@ -174,7 +203,12 @@ class Node:
     # ---- lifecycle ----
 
     def start(self) -> None:
+        with self.mu:
+            self.started = True
+            if self.cfg.on_config is not None:
+                self.cfg.on_config(self.mem)
         self.wg.go(self._election_loop, name="raft-election")
+        self.wg.go(self._promote_loop, name="raft-promote")
         self.wg.go(self._apply_loop, name="raft-apply")
         self.wg.go(self._append_loop, name="raft-append")
         self.wg.go(self._sync_loop, name="raft-sync")
@@ -189,7 +223,7 @@ class Node:
             self.stop_ev.set()
             self.cond.notify_all()
         self.prop_sig.set()
-        for ev in self.kick.values():
+        for ev in list(self.kick.values()):
             ev.set()
         self.wg.wait()
         with self.mu:
@@ -205,7 +239,75 @@ class Node:
     # ---- helpers (mu held unless noted) ----
 
     def _quorum(self) -> int:
-        return (len(self.others) + 1) // 2 + 1
+        return len(self.voters) // 2 + 1
+
+    def membership(self) -> Membership:
+        """The configuration in effect (the latest in the log, committed or not)."""
+        with self.mu:
+            return self.mem
+
+    def _vote_peers(self):
+        return [p for p in self.voters if p != self.cfg.id], self._quorum()
+
+    def _set_config(self, mem: Membership, index: int) -> None:
+        """Make mem the configuration in effect. mu held."""
+        self.mem, self.config_index, self.voters = mem, index, mem.voters
+        self.others = sorted(p for p in mem.members if p != self.cfg.id)
+        for p in self.others:
+            if p not in self.kick:
+                self.kick[p] = threading.Event()
+                if self.started and not self.stopped:
+                    self.wg.go(self._replicator, p, name="raft-repl-" + p)
+            if self.role == LEADER and p not in self.next:
+                self.next[p] = self.log.last_index() + 1
+                self.match[p] = 0
+        self.cfg.logf("[%s] configuration at %d: %r", self.cfg.id, index, mem)
+        if self.cfg.on_config is not None:
+            self.cfg.on_config(mem)
+        self.cond.notify_all()
+
+    def _config_at(self, index: int) -> Membership:
+        cur = self.base
+        for i, m in self.hist:
+            if i > index:
+                break
+            cur = m
+        return cur
+
+    def _config_entry_appended(self, e: Entry) -> None:
+        try:
+            m = Membership.decode(e.data or b"")
+        except Exception as ex:
+            self._fatal(ex)
+            raise
+        self.hist.append((e.index, m))
+        self._set_config(m, e.index)
+
+    def _log_truncated(self, index: int) -> None:
+        """Entries from index on are gone: forget configurations they carried."""
+        if self.hist and self.hist[-1][0] >= index:
+            self.hist = [h for h in self.hist if h[0] < index]
+            i, m = self.hist[-1] if self.hist else (self.base_index, self.base)
+            self._set_config(m, i)
+
+    def _fold_base(self, upto: int) -> bool:
+        """Persist the configuration in effect at `upto` as the new base so
+        the log entries that carried it may be dropped."""
+        n = 0
+        for k, (i, _) in enumerate(self.hist):
+            if i <= upto:
+                n = k + 1
+        if n == 0:
+            return True
+        i, m = self.hist[n - 1]
+        try:
+            save_base(self.cfg.dir, i, m)
+        except Exception as e:
+            self._fatal(e)
+            return False
+        self.base_index, self.base = i, m
+        self.hist = self.hist[n:]
+        return True
 
     def _reset_election_timer(self) -> None:
         t = self.cfg.election_timeout
@@ -268,14 +370,17 @@ class Node:
         tick = self.cfg.election_timeout / 10
         while not self.stop_ev.wait(tick):
             with self.mu:
-                if self.failed is None and self.role != LEADER and time.monotonic() > self.election_deadline:
+                # Learners (and nodes not in any configuration yet) never campaign.
+                if (self.failed is None and self.role != LEADER and self.cfg.id in self.voters
+                        and time.monotonic() > self.election_deadline):
                     self._reset_election_timer()
                     term = self.term + 1
                     li, lt = self.log.last_index(), self.log.last_term()
-                    self.wg.go(self._run_election, term, li, lt, name="raft-vote")
+                    peers, quorum = self._vote_peers()
+                    self.wg.go(self._run_election, term, li, lt, peers, quorum, name="raft-vote")
 
-    def _gather(self, pre: bool, term: int, last_idx: int, last_term: int) -> bool:
-        """Ask all peers for votes and report whether a majority granted."""
+    def _gather(self, pre: bool, term: int, last_idx: int, last_term: int, peers, quorum) -> bool:
+        """Ask the voting peers for votes and report whether a majority granted."""
         results = queue.Queue()
 
         def ask(p):
@@ -286,10 +391,10 @@ class Node:
             except Exception:
                 results.put(None)
 
-        for p in self.others:
+        for p in peers:
             threading.Thread(target=ask, args=(p,), daemon=True, name="raft-ask").start()
         votes = 1
-        for _ in self.others:
+        for _ in peers:
             while True:
                 try:
                     resp = results.get(timeout=0.05)
@@ -306,12 +411,12 @@ class Node:
                 return False
             if resp.granted:
                 votes += 1
-            if votes >= self._quorum():
+            if votes >= quorum:
                 return True
-        return votes >= self._quorum()
+        return votes >= quorum
 
-    def _run_election(self, term: int, last_idx: int, last_term: int) -> None:
-        if self.others and not self._gather(True, term, last_idx, last_term):
+    def _run_election(self, term: int, last_idx: int, last_term: int, peers, quorum) -> None:
+        if peers and not self._gather(True, term, last_idx, last_term, peers, quorum):
             return
         with self.mu:
             if self.failed is not None or self.role == LEADER or self.term + 1 != term:
@@ -320,7 +425,8 @@ class Node:
             self._persist_hard_state()
             self._reset_election_timer()
             last_idx, last_term = self.log.last_index(), self.log.last_term()
-        won = not self.others or self._gather(False, term, last_idx, last_term)
+            peers, quorum = self._vote_peers()
+        won = not peers or self._gather(False, term, last_idx, last_term, peers, quorum)
         with self.mu:
             if won and self.term == term and self.role == CANDIDATE and self.failed is None:
                 self._become_leader()
@@ -423,6 +529,7 @@ class Node:
                     except Exception as ex:
                         self._fatal(ex)
                         raise
+                    self._log_truncated(e.index)
                 to_append = req.entries[i:]
                 break
             try:
@@ -430,6 +537,9 @@ class Node:
             except Exception as ex:
                 self._fatal(ex)
                 raise
+            for e in to_append:
+                if e.kind == KIND_CONFIG:  # takes effect when appended, not when committed
+                    self._config_entry_appended(e)
             last_new = req.prev_index + len(req.entries)
             if req.commit > self.commit:
                 c = min(req.commit, last_new)
@@ -492,6 +602,15 @@ class Node:
                 raise
             s.next_seq += 1
             if req.done:
+                mem = Membership.decode(req.config) if req.config else None
+                if mem is not None:
+                    # Before the swap: a crash after it must find the new configuration.
+                    try:
+                        save_base(self.cfg.dir, s.snap_idx, mem)
+                    except Exception as e:
+                        self._abort_restore()
+                        self._fatal(e)
+                        raise
                 try:
                     self.cfg.sm.restore_finish(s.snap_idx, s.snap_term)
                 except Exception as e:
@@ -507,6 +626,9 @@ class Node:
                     self.commit = s.snap_idx
                 self.applied = self.sm_applied = self.durable = s.snap_idx
                 self.restoring = None
+                if mem is not None:
+                    self.base_index, self.base, self.hist = s.snap_idx, mem, []
+                    self._set_config(mem, s.snap_idx)
                 self.cfg.logf("[%s] installed snapshot at %d", self.cfg.id, s.snap_idx)
                 self.cond.notify_all()
             resp.ok = True
@@ -515,10 +637,13 @@ class Node:
     # ---- log replication: leader side ----
 
     def _advance_commit(self) -> None:
-        m = [self.log.last_index()]  # own log is durable
-        m.extend(self.match.get(p, 0) for p in self.others)
+        m = [self.log.last_index()] if self.cfg.id in self.voters else []  # own log is durable
+        m.extend(self.match.get(p, 0) for p in self.voters if p != self.cfg.id)
         m.sort(reverse=True)
-        c = m[self._quorum() - 1]
+        q = self._quorum()
+        if len(m) < q:
+            return
+        c = m[q - 1]
         if c > self.commit:
             t = self.log.term(c)
             if t is not None and t == self.term:  # only current-term entries commit by counting
@@ -541,6 +666,8 @@ class Node:
         whether more should be sent right away."""
         with self.mu:
             if self.role != LEADER or self.failed is not None or self.stopped:
+                return False
+            if peer not in self.next:
                 return False
             term, nxt = self.term, self.next[peer]
             if nxt <= self.log.prev_index:  # the entry before next was compacted away
@@ -602,6 +729,7 @@ class Node:
             snap_term = self.log.term(snap_index)
             if snap_term is None:
                 return False
+            config = self._config_at(snap_index).encode()
             self.snap_pin[peer] = snap_index
             session = self.rnd.getrandbits(64)
         try:
@@ -613,7 +741,7 @@ class Node:
                 try:
                     resp = self.cfg.transport.install_snapshot(peer, SnapReq(
                         term, self.cfg.id, session, seq, snap_index, snap_term,
-                        [KV(k, v) for k, v in items], done))
+                        [KV(k, v) for k, v in items], done, config))
                 except Exception:
                     return False
                 with self.mu:
@@ -727,7 +855,8 @@ class Node:
                 lo, hi = self.applied + 1, self.commit
                 if hi - lo >= MAX_APPLY_BATCH:
                     hi = lo + MAX_APPLY_BATCH - 1
-                cmds = [e.data for e in self.log.slice(lo, hi - lo + 1, 1 << 62) if e.data is not None]
+                cmds = [e.data for e in self.log.slice(lo, hi - lo + 1, 1 << 62)
+                        if e.data is not None and e.kind == KIND_NORMAL]
                 term = self._term_of(hi)
                 self.applying = True
                 self.mu.release()
@@ -778,6 +907,8 @@ class Node:
             if pin < target:
                 target = pin
         if target > self.log.prev_index:
+            if not self._fold_base(target):
+                return
             try:
                 self.log.compact_to(target)
             except Exception as e:
@@ -826,9 +957,9 @@ class Node:
             self._kick_all()
 
             def confirmed() -> bool:
-                c = 1
-                for p in self.others:
-                    if self.ack_time.get(p, float("-inf")) >= t0:
+                c = 1 if self.cfg.id in self.voters else 0
+                for p in self.voters:
+                    if p != self.cfg.id and self.ack_time.get(p, float("-inf")) >= t0:
                         c += 1
                 return c >= self._quorum()
 
@@ -836,3 +967,123 @@ class Node:
                                                 or (confirmed() and self.applied >= read_idx)))
             if self.role != LEADER or self.term != term:
                 raise self._not_leader()
+
+    # ---- membership changes ----
+
+    def _can_change_config(self) -> bool:
+        """One change at a time, and only once an entry of this term has
+        committed (so the previous configuration is known to be committed).
+        mu held, leader."""
+        return self.config_index <= self.commit and self.log.term(self.commit) == self.term
+
+    def _append_config(self, m: Membership) -> None:
+        idx = self.log.last_index() + 1
+        e = Entry(self.term, idx, m.encode(), KIND_CONFIG)
+        try:
+            self.log.append([e])
+        except Exception as ex:
+            self._fatal(ex)
+            raise
+        self.hist.append((idx, m))
+        self._set_config(m, idx)  # before advancing the commit: the quorum changed
+        self._advance_commit()
+        self._kick_all()
+
+    def add_member(self, nid: str, info: str = "") -> bool:
+        """Leader only: add nid as a non-voting learner. It receives the log or
+        a snapshot like any follower and is promoted to voter automatically
+        once it has caught up. Returns False if nid is already a member or
+        another change is still in flight (the caller may retry)."""
+        with self.mu:
+            if self.stopped:
+                raise StoppedError()
+            if self.failed is not None:
+                raise self.failed
+            if self.role != LEADER:
+                raise self._not_leader()
+            if nid in self.mem.members or not self._can_change_config():
+                return False
+            self._append_config(self.mem.with_learner(nid, info))
+            return True
+
+    def _promote_loop(self) -> None:
+        """Promote caught-up learners to voters, one at a time."""
+        while not self.stop_ev.wait(self.cfg.heartbeat_interval * 2):
+            with self.mu:
+                if self.role != LEADER or self.failed is not None or not self._can_change_config():
+                    continue
+                now, last = time.monotonic(), self.log.last_index()
+                for p in self.mem.learners():
+                    m = self.match.get(p, 0)
+                    fresh = now - self.ack_time.get(p, float("-inf")) < self.cfg.election_timeout
+                    if m > 0 and last - m <= self.cfg.max_batch_entries and fresh:
+                        self.cfg.logf("[%s] promoting %s to voter", self.cfg.id, p)
+                        try:
+                            self._append_config(self.mem.with_voter(p))
+                        except Exception:
+                            pass
+                        break
+
+    # ---- bootstrapping a new node from a peer's state ----
+
+    def handle_pull_snapshot(self, req: PullReq) -> PullResp:
+        """Serve one chunk of this node's state to a joining node. Any member
+        may answer; the copy is a fuzzy snapshot anchored at the applied index
+        of the first chunk, completed by normal replication afterwards."""
+        resp = PullResp()
+        with self.mu:
+            if self.stopped:
+                raise StoppedError()
+            if self.failed is not None:
+                raise self.failed
+            if self.restoring is not None:
+                raise RaftError("raft: busy installing a snapshot")
+            if req.cursor is None:
+                resp.snap_index = self.sm_applied
+                resp.snap_term = self.log.term(resp.snap_index)
+                if resp.snap_term is None:
+                    raise RaftError("raft: snapshot anchor is not available")
+                resp.config = self._config_at(resp.snap_index).encode()
+        items, nxt, done = self.cfg.sm.snapshot_scan(req.cursor, self.cfg.snapshot_chunk_bytes)
+        resp.items = [KV(k, v) for k, v in items]
+        resp.next_cursor, resp.done = nxt, done
+        return resp
+
+    def bootstrap(self, pull: Callable[[PullReq], PullResp]) -> bool:
+        """Initialise a fresh, not yet started node with a copy of a peer's
+        state, fetched chunk by chunk through pull. Returns False if there was
+        nothing to copy or the node is not fresh. On failure the node is left
+        empty, and the leader will send it a snapshot instead."""
+        with self.mu:
+            if (self.started or self.applied != 0 or self.log.last_index() != 0
+                    or self.log.prev_index != 0):
+                return False
+        sm = self.cfg.sm
+        anchor = None
+        cursor = None
+        sm.restore_begin()
+        try:
+            while True:
+                r = pull(PullReq(cursor))
+                if anchor is None:
+                    if r.snap_index == 0:  # the peer has applied nothing: nothing to copy
+                        sm.restore_abort()
+                        return False
+                    anchor = (r.snap_index, r.snap_term, Membership.decode(r.config))
+                sm.restore_chunk(r.items)
+                if r.done:
+                    break
+                cursor = r.next_cursor
+            idx, term, mem = anchor
+            with self.mu:
+                save_base(self.cfg.dir, idx, mem)
+                sm.restore_finish(idx, term)
+                self.log.reset(idx, term)
+                self.commit = self.applied = self.sm_applied = self.durable = idx
+                self.base_index, self.base, self.hist = idx, mem, []
+                self._set_config(mem, idx)
+            self.cfg.logf("[%s] bootstrapped from a peer at %d", self.cfg.id, idx)
+            return True
+        except BaseException:
+            sm.restore_abort()
+            raise

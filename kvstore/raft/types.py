@@ -2,11 +2,17 @@
 ReadIndex linearizable reads and log compaction with fuzzy snapshots, on top
 of a pluggable state machine and transport.
 
-Membership is static: the set of node IDs is fixed in Config.
+Membership is dynamic: the initial set of node IDs comes from Config, later
+changes (single-server additions via learners) are replicated as log entries
+of kind KIND_CONFIG.
 """
 
 from dataclasses import dataclass, field
 from typing import List, NamedTuple, Optional
+
+
+KIND_NORMAL = 0  # a state machine command (data) or a no-op (data is None)
+KIND_CONFIG = 1  # an encoded raft.Membership; handled by Raft, never given to the state machine
 
 
 @dataclass
@@ -14,6 +20,7 @@ class Entry:
     term: int
     index: int
     data: Optional[bytes] = None  # None = no-op (appended by a new leader)
+    kind: int = KIND_NORMAL
 
 
 class KV(NamedTuple):
@@ -67,6 +74,26 @@ class SnapReq:
     snap_term: int
     items: List[KV] = field(default_factory=list)
     done: bool = False
+    config: bytes = b""  # encoded Membership in effect at snap_index
+
+
+@dataclass
+class PullReq:
+    """A new node asks a peer for a copy of its state (see Node.bootstrap).
+    cursor is None for the first chunk, then the previous response's next_cursor."""
+
+    cursor: Optional[bytes] = None
+
+
+@dataclass
+class PullResp:
+    items: List[KV] = field(default_factory=list)
+    next_cursor: Optional[bytes] = None
+    done: bool = False
+    # Anchor of the whole snapshot; set in the first response only (snap_index 0 = "as before").
+    snap_index: int = 0
+    snap_term: int = 0
+    config: bytes = b""
 
 
 @dataclass
